@@ -3,7 +3,8 @@
 A release spans two repos: this one (the source) and
 [homebrew-tap](https://github.com/ryanmoelter/homebrew-tap) (the formulas). Both are
 submodules of the dotfiles repo, so everything below can be done from `~/dotfiles`. It
-ends with a GitHub release whose notes are Ryan's changelog text (steps 2 and 8).
+ends with a GitHub release whose notes are the changelog section Ryan approved
+(steps 2 and 8).
 
 ## The one thing that fails silently
 
@@ -33,11 +34,13 @@ Commit whatever is going out, in `cli-tools/`.
 `tests/test_version.py` checks all three agree, so a missed one fails the suite rather
 than shipping.
 
-**Stop here and ask Ryan to write the changelog entries.** He owns all user-facing text,
-and this section becomes the GitHub release notes verbatim in step 8 — so it is his
-wording that ships, not a summary of the diff. An agent may bump the two version numbers
-and add the empty `## $V` heading, then wait. Do not draft the bullets, even as a
-placeholder.
+**Ryan approves the changelog entries before the release goes out.** This section becomes
+the GitHub release notes verbatim in step 8, and he owns all user-facing text — so the
+wording that ships is wording he signed off on.
+
+An agent may draft the bullets as a starting point. Draft them, then **stop and ask** —
+show him the proposed section and wait for approval or a rewrite. Do not carry a draft
+past this point unreviewed: once step 3 tags and step 8 publishes, the text is public.
 
 ### 3. Test, then tag
 
