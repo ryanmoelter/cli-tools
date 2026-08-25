@@ -108,6 +108,8 @@ python3 -m unittest discover tests    # stdlib only, no deps
 
 If you're building/editing locally and also have the Homebrew version installed, check your PATH to make sure you're running the expected version.
 
+Cutting a release: see [RELEASING.md](RELEASING.md).
+
 Feel free to make an issue for anything you want to see!
 
 ## License
