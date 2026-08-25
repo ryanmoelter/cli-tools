@@ -1,0 +1,2028 @@
+#!/usr/bin/env python3
+"""wt — worktree helper
+
+Designed to make it easy to work with multiple Claude Code agents at the same
+time.
+
+- Requires no special worktree set up in repo.
+- Opens new worktrees in a new terminal tab on macOS — a tab in the current
+  cmux workspace (when run inside cmux) or a Ghostty tab — but fails
+  gracefully otherwise.
+- Finds every worktree git knows about, wherever it lives on disk — including
+  ones created by other tools or by hand.
+- Works with bare repos (worktrees at git repo root).
+- Customizable per-repo for the branch prefix.
+
+Some useful workflows:
+
+- Start a new task in a background tree:  wt co -b <name>
+- Foreground a task to current worktree:  wt foreground <worktree name>
+- Background a task out of the current worktree:  wt background <new worktree name>
+- See all worktrees + their status:  wt list
+
+Subcommands:
+  checkout|co   [-b] <branch> [--no-tab|--workspace]
+                                       check out a branch in a new worktree (-b creates)
+  cob           <branch> [--no-tab|--workspace]
+                                       shorthand for `co -b` (create + check out)
+  open|o        <name> [--workspace]   open a worktree in a new terminal tab
+  background|bg [name] [--no-tab|--workspace]
+                                       relocate current branch + changes to a new worktree
+  list|l        [--json] [--paths]     show worktrees + change/PR markers
+  delete|d      <name> [-f|--force]    remove worktree (branch left intact)
+  prune|p       [-y|--yes]             delete worktrees whose PR/MR is merged or closed
+  rename|r      [name] <new> [-f|--folder]  rename branch (optionally folder too)
+  commit|cm     <name> [git-args]      commit -a in another worktree
+  switch|s      <name|branch>          cd there (needs the shell wrapper)
+  path          <name|branch>          print the path; for scripts
+  current       [--json]               report the cwd's worktree + branch
+  foreground|fg <name>                 pull another worktree's branch into cwd
+  setup                                 interactively configure wt.* git config
+  help|-h|--help                        show usage + resolved config
+  __complete worktrees|branches        hidden: emit completion candidates
+
+Worktrees are discovered from git's own registry (`git worktree list`), so any
+worktree of the repo is recognized no matter where it sits. The layout —
+auto-detected from the current repo — only decides where *new* ones are created:
+
+  Bare layout: WT_ROOT contains a `.bare/` dir;
+    new worktrees are direct children of WT_ROOT.
+
+  Standard layout: WT_ROOT is the main worktree (git root); new worktrees go
+    under WT_ROOT/.worktrees/<name>, which is kept self-ignored.
+
+Settings live in git config under ryanmoelter-cli-tools.*, shared with stack, so each
+one needs setting only once. A repo-local value overrides a global one, so
+`--global` gives user-wide defaults:
+  git config ryanmoelter-cli-tools.baseBranch staging   # default: origin/HEAD → "main"
+  git config ryanmoelter-cli-tools.branchPrefix me/     # default: <local-part of user.email>/
+  git config ryanmoelter-cli-tools.branchPrefix ""      # no prefix — branches use bare names
+  git config ryanmoelter-cli-tools.forge gitlab         # github|gitlab|none; default: from origin URL
+  git config ryanmoelter-cli-tools.nerdFont true        # Nerd Font glyphs; default: plain Unicode
+  git config --add ryanmoelter-cli-tools.protectedWorktrees foo
+                                              # repeatable; worktree folder names that
+                                              # refuse delete/rename/foreground. .bare
+                                              # and the main worktree are always protected
+  git config --add ryanmoelter-cli-tools.ignoredPendingChecks "ci/slow job"
+                                              # repeatable; CI checks whose perpetual
+                                              # "pending" shouldn't mask the result
+
+`wt setup` sets these interactively. Matching wt.* keys are still read and win
+when set, for backwards compatibility only.
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+# Shared infrastructure (Git/forge backends, colors, PR glyphs) lives in
+# _common/ next to this script; see gitcore.py's module docstring.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "_common"))
+
+import forge
+import gitcore
+import ui
+from forge import fetch_github_prs, fetch_gitlab_prs, start_fetch
+from gitcore import die, run_
+from ui import (  # noqa: F401 (set_color re-exported for tests)
+    branch_pr_chip, pr_chip, pr_loading_chip, pr_net_off_chip, set_color,
+)
+
+gitcore.set_prog("wt")
+
+
+# -------- terminal tabs --------
+
+
+class TabOpener:
+    """Opens a directory in a new terminal tab/workspace. Prefers cmux when
+    we're running inside it (cmux embeds Ghostty, so TERM_PROGRAM can't tell
+    them apart — the CMUX_* env vars can), then standalone Ghostty via
+    AppleScript, then a printed path + cd hint. Every path is best-effort:
+    callers treat a failure to open as non-fatal.
+
+    All process/env access goes through _which/_run/env/platform so tests can
+    substitute fakes and drive the driver-selection logic directly."""
+
+    def __init__(self, env=None, platform=None):
+        self.env = os.environ if env is None else env
+        self.platform = sys.platform if platform is None else platform
+
+    def _which(self, name):
+        return shutil.which(name)
+
+    def _run(self, args, input_=None):
+        """→ (returncode, stdout). Never raises."""
+        try:
+            p = subprocess.run(
+                args, text=True, input=input_,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+            return p.returncode, p.stdout
+        except OSError:
+            return 1, ""
+
+    def open(self, dir_, workspace=False):
+        if workspace:
+            if self._try_cmux(dir_):
+                return
+        elif self._try_cmux_surface(dir_):
+            return
+        if self._try_ghostty(dir_):
+            return
+        print(f"wt: {dir_}")
+        print(f'wt: (cd "{dir_}")')
+
+    def _try_cmux_surface(self, dir_):
+        # A tab ("surface") in the *current* cmux workspace: a worktree
+        # belongs to the task at hand rather than standing alone, so this is
+        # the default. `new-surface` has no --cwd, so the cd is typed into the
+        # fresh shell (send + enter), then the tab is named after the worktree
+        # folder. Opens unfocused: the caller's tab keeps focus and this one
+        # waits alongside it. cd/rename failures are tolerated (the surface
+        # exists); a failed create falls back to Ghostty, never to a new
+        # workspace — that is only ever explicit, via --workspace.
+        if not (self.env.get("CMUX_WORKSPACE_ID") or self.env.get("CMUX_SOCKET_PATH")):
+            return False
+        cmux_bin = self.env.get("CMUX_BUNDLED_CLI_PATH") or "cmux"
+        if not (os.access(cmux_bin, os.X_OK) or self._which(cmux_bin)):
+            return False
+        rc, out = self._run(
+            [cmux_bin, "new-surface", "--type", "terminal", "--focus", "false"]
+        )
+        if rc != 0:
+            return False
+        ref = self._parse_surface_ref(out)
+        if not ref:
+            return False
+        self._run([cmux_bin, "send", "--surface", ref, f'cd "{dir_}"'])
+        self._run([cmux_bin, "send-key", "--surface", ref, "enter"])
+        self._run([cmux_bin, "rename-tab", "--surface", ref, os.path.basename(dir_)])
+        return True
+
+    def _try_cmux(self, dir_):
+        # Open the dir in a new workspace (only on --workspace), placed in the
+        # *same group* as the current workspace so a worktree lands next to
+        # its siblings (e.g.
+        # under "Dotfiles + tools") rather than ungrouped. If the current
+        # workspace is in no group, fall back to the bare `cmux <path>` form
+        # (not `cmux open`, which makes a file-preview tab). On a cmux too old
+        # for `create --group` the create still succeeds (just ungrouped), so
+        # we never double-open. Use the bundled CLI when cmux points at it.
+        # After a grouped create we also copy the group's dominant color onto
+        # the new workspace (see _apply_group_color) so it matches its siblings.
+        if not (self.env.get("CMUX_WORKSPACE_ID") or self.env.get("CMUX_SOCKET_PATH")):
+            return False
+        cmux_bin = self.env.get("CMUX_BUNDLED_CLI_PATH") or "cmux"
+        if not (os.access(cmux_bin, os.X_OK) or self._which(cmux_bin)):
+            return False
+        ws_id = self.env.get("CMUX_WORKSPACE_ID")
+        group_id = ""
+        if ws_id:
+            rc, out = self._run([cmux_bin, "rpc", "workspace.group.list"])
+            if rc == 0:
+                group_id = self._group_of(out, ws_id)
+        if group_id:
+            rc, create_out = self._run([
+                cmux_bin, "workspace", "create", "--cwd", dir_,
+                "--group", group_id, "--group-placement", "afterCurrent",
+                "--group-reference", ws_id, "--focus", "true",
+            ])
+            if rc == 0:
+                self._apply_group_color(cmux_bin, out, group_id, ws_id, create_out)
+                return True
+        rc, _ = self._run([cmux_bin, dir_])
+        return rc == 0
+
+    def _apply_group_color(self, cmux_bin, groups_json, group_id, ref_ws_id, create_out):
+        """Paint the just-created workspace with the group's most popular
+        color so a new worktree matches its colored siblings. Pure polish:
+        every step is best-effort and a failure just leaves the workspace at
+        cmux's default. A group with no colored members is left alone."""
+        new_ref = self._parse_created_ref(create_out)
+        if not new_ref:
+            return
+        member_ids = self._members_of(groups_json, group_id)
+        if not member_ids:
+            return
+        rc, ws_out = self._run(
+            [cmux_bin, "--id-format", "both", "workspace", "list", "--json"]
+        )
+        if rc != 0:
+            return
+        color = self._dominant_color(ws_out, member_ids, ref_ws_id)
+        if not color:
+            return
+        self._run([
+            cmux_bin, "workspace-action", "--action", "set-color",
+            "--color", color, "--workspace", new_ref,
+        ])
+
+    @staticmethod
+    def _group_of(rpc_json, ws_id):
+        """id of the first group containing ws_id, or ""."""
+        try:
+            data = json.loads(rpc_json)
+        except (json.JSONDecodeError, TypeError):
+            return ""
+        for group in data.get("groups") or []:
+            if ws_id in (group.get("member_workspace_ids") or []):
+                return group.get("id") or ""
+        return ""
+
+    @staticmethod
+    def _members_of(rpc_json, group_id):
+        """member_workspace_ids (UUIDs) for group_id, or []. Twin of
+        _group_of, keyed the other way (group → members)."""
+        try:
+            data = json.loads(rpc_json)
+        except (json.JSONDecodeError, TypeError):
+            return []
+        for group in data.get("groups") or []:
+            if group.get("id") == group_id:
+                return group.get("member_workspace_ids") or []
+        return []
+
+    @staticmethod
+    def _parse_created_ref(create_out):
+        """'workspace:NN' from `workspace create`'s "OK workspace:NN" line,
+        or "" when the output isn't recognizable."""
+        m = re.match(r"OK (workspace:\S+)", create_out.strip())
+        return m.group(1) if m else ""
+
+    @staticmethod
+    def _parse_surface_ref(create_out):
+        """'surface:NN' from `new-surface`'s "OK surface:NN pane:NN ..." line,
+        or "" when the output isn't recognizable."""
+        m = re.match(r"OK (surface:\S+)", create_out.strip())
+        return m.group(1) if m else ""
+
+    @staticmethod
+    def _dominant_color(workspaces_json, member_ids, ref_ws_id):
+        """Most-used custom_color among member_ids, per `workspace list --json`
+        (members matched on the UUID `id` field). A tie is broken toward the
+        reference workspace's own color when it's among the leaders, else
+        first-seen order. "" when no member is colored or the JSON is bad."""
+        try:
+            data = json.loads(workspaces_json)
+        except (json.JSONDecodeError, TypeError):
+            return ""
+        members = set(member_ids)
+        counts, order, ref_color = {}, [], ""
+        for ws in data.get("workspaces") or []:
+            wid = ws.get("id")
+            if wid not in members:
+                continue
+            color = ws.get("custom_color")
+            if not color:
+                continue
+            if color not in counts:
+                order.append(color)
+            counts[color] = counts.get(color, 0) + 1
+            if wid == ref_ws_id:
+                ref_color = color
+        if not counts:
+            return ""
+        top = max(counts.values())
+        if ref_color and counts[ref_color] == top:
+            return ref_color
+        return next(c for c in order if counts[c] == top)
+
+    def _try_ghostty(self, dir_):
+        # Escape backslashes and double-quotes so paths with those chars don't
+        # break (or smuggle) AppleScript string literals.
+        if not self.platform.startswith("darwin") or not self._which("osascript"):
+            return False
+        esc = dir_.replace("\\", "\\\\").replace('"', '\\"')
+        script = (
+            'tell application "Ghostty"\n'
+            "  set cfg to new surface configuration\n"
+            f'  set initial working directory of cfg to "{esc}"\n'
+            "  new tab with configuration cfg in front window\n"
+            "end tell"
+        )
+        rc, _ = self._run(["osascript"], input_=script)
+        return rc == 0
+
+
+# -------- git backend --------
+# All git subprocess access for wt; tests substitute fakes at the Ctx seam.
+
+
+class WtGit(gitcore.ConfigMixin):
+    def __init__(self):
+        self.repo_dir = None  # set once the layout is detected
+
+    # --- raw runners; out: "inherit" (user-visible), "quiet" (stdout
+    # suppressed, stderr visible), "silent" (both suppressed) ---
+
+    def _rc(self, args, out="silent"):
+        stdout = None if out == "inherit" else subprocess.DEVNULL
+        stderr = subprocess.DEVNULL if out == "silent" else None
+        return subprocess.run(args, stdout=stdout, stderr=stderr).returncode
+
+    def _repo_git(self, *args):
+        return ["git", "-C", self.repo_dir, *args]
+
+    # Config reads/writes anchor to the repo, not the cwd.
+    def _git_cmd(self, *args):
+        return self._repo_git(*args)
+
+    def visible_ok(self, args):
+        return self._rc(args, out="inherit") == 0
+
+    def visible_fatal(self, args, quiet_stdout=False):
+        """Mirror zsh's `set -e`: on failure exit with git's own code (its
+        error output has already gone to the terminal)."""
+        rc = self._rc(args, out="quiet" if quiet_stdout else "inherit")
+        if rc != 0:
+            sys.exit(rc)
+
+    def silent_ok(self, args):
+        return self._rc(args, out="silent") == 0
+
+    def out_or_none(self, args):
+        p = run_(args, check=False)
+        return p.stdout.rstrip("\n") if p.returncode == 0 else None
+
+    # --- bootstrap (plain cwd git) ---
+
+    def toplevel(self):
+        return self.out_or_none(["git", "rev-parse", "--show-toplevel"])
+
+    def common_dir(self, root):
+        return self.out_or_none(["git", "-C", root, "rev-parse", "--git-common-dir"])
+
+    # --- repo-anchored ---
+
+    def origin_url(self):
+        return self.out_or_none(self._repo_git("remote", "get-url", "origin"))
+
+    def origin_head(self):
+        return self.out_or_none(
+            self._repo_git("symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+        )
+
+    def branch_exists(self, b):
+        return self.silent_ok(self._repo_git("show-ref", "--verify", f"refs/heads/{b}"))
+
+    def local_branches(self):
+        out = self.out_or_none(
+            self._repo_git("for-each-ref", "--format=%(refname:short)", "refs/heads")
+        )
+        return out.splitlines() if out else []
+
+    def worktree_entries(self):
+        """[(path, branch or None)] for every worktree git knows about, the main
+        worktree first and detached HEADs included. Single source of truth for
+        parsing `git worktree list --porcelain`, whose blank-line-separated
+        records are `worktree <path>`, `HEAD <sha>`, then either
+        `branch refs/heads/<name>` or `detached`.
+
+        A record is flushed when the next one starts rather than on its `branch`
+        line, so a detached worktree — which has no such line — still yields an
+        entry."""
+        out = self.out_or_none(self._repo_git("worktree", "list", "--porcelain")) or ""
+        entries, wt_path, branch = [], None, None
+        for line in out.splitlines():
+            if line.startswith("worktree "):
+                if wt_path is not None:
+                    entries.append((wt_path, branch))
+                wt_path, branch = line[len("worktree "):], None
+            elif line.startswith("branch refs/heads/"):
+                branch = line[len("branch refs/heads/"):]
+        if wt_path is not None:
+            entries.append((wt_path, branch))
+        return entries
+
+    def worktree_records(self):
+        """[(branch, path)] per worktree, skipping detached HEADs — for callers
+        that act on the branch itself (PR lookup, branch deletion, completion)."""
+        return [(branch, path) for path, branch in self.worktree_entries()
+                if branch is not None]
+
+    def fetch_base(self, base_branch, quiet=False):
+        args = self._repo_git("fetch", "origin", base_branch)
+        if quiet:
+            self.silent_ok(args)  # best-effort
+        else:
+            self.visible_fatal(args)
+
+    def worktree_add(self, wt_path, branch, new=False, base_ref=None, fatal=True):
+        if new:
+            args = self._repo_git("worktree", "add", "--no-track", "-b", branch, wt_path, base_ref)
+        else:
+            args = self._repo_git("worktree", "add", wt_path, branch)
+        if fatal:
+            self.visible_fatal(args)
+            return True
+        return self.visible_ok(args)
+
+    def worktree_remove(self, wt_path, force=False):
+        args = self._repo_git("worktree", "remove", *(["--force"] if force else []), wt_path)
+        self.visible_fatal(args)
+
+    def branch_delete(self, branch, force=False):
+        self.visible_fatal(self._repo_git("branch", "-D" if force else "-d", branch))
+
+    def worktree_move(self, old_path, new_path):
+        self.visible_fatal(self._repo_git("worktree", "move", old_path, new_path))
+
+    # --- per-worktree ---
+
+    def branch_of(self, wt_path):
+        p = run_(["git", "-C", wt_path, "rev-parse", "--abbrev-ref", "HEAD"], check=False)
+        if p.returncode != 0:
+            sys.exit(p.returncode)
+        return p.stdout.strip()
+
+    def is_clean(self, wt_path):
+        p = run_(["git", "-C", wt_path, "status", "--porcelain"], check=False)
+        if p.returncode != 0:
+            sys.exit(p.returncode)
+        return not p.stdout.strip()
+
+    def status_v2_lines(self, wt_path):
+        out = self.out_or_none(["git", "-C", wt_path, "status", "-b", "--porcelain=v2"])
+        return out.splitlines() if out else []
+
+    def short_head(self, wt_path):
+        return self.out_or_none(["git", "-C", wt_path, "rev-parse", "--short", "HEAD"])
+
+    def ahead_count(self, wt_path, base_ref):
+        """Commits ahead of base_ref as a string, "" when unanswerable."""
+        out = self.out_or_none(
+            ["git", "-C", wt_path, "rev-list", "--count", f"{base_ref}..HEAD"]
+        )
+        return out if out is not None else ""
+
+    def checkout_ok(self, wt_path, ref, detach=False, silent=True):
+        args = ["git", "-C", wt_path, "checkout"] + (["--detach"] if detach else []) + [ref]
+        return self.silent_ok(args) if silent else self.visible_ok(args)
+
+    def checkout_fatal(self, wt_path, ref, detach=False, quiet_stdout=True):
+        args = ["git", "-C", wt_path, "checkout"] + (["--detach"] if detach else []) + [ref]
+        self.visible_fatal(args, quiet_stdout=quiet_stdout)
+
+    def stash_push(self, wt_path, msg):
+        self.visible_fatal(
+            ["git", "-C", wt_path, "stash", "push", "--include-untracked", "-m", msg]
+        )
+
+    def stash_pop_ok(self, wt_path, silent=False):
+        args = ["git", "-C", wt_path, "stash", "pop"]
+        return self.silent_ok(args) if silent else self.visible_ok(args)
+
+    def branch_move(self, wt_path, old, new):
+        self.visible_fatal(["git", "-C", wt_path, "branch", "-m", old, new])
+
+    def commit_a(self, wt_path, extra_args):
+        return self._rc(["git", "-C", wt_path, "commit", "-a", *extra_args], out="inherit")
+
+    def enable_untracked_cache(self, wt_path):
+        # No-op (and silent) where unsupported; never fails the caller.
+        self.silent_ok(["git", "-C", wt_path, "update-index", "--untracked-cache"])
+
+    def test_untracked_cache(self):
+        return self.silent_ok(self._repo_git("update-index", "--test-untracked-cache"))
+
+
+# -------- layout + config context --------
+
+
+class Ctx:
+    """Layout + resolved config, built once in main(). The list-facing methods
+    (list_worktree_names / worktree_path / worktree_paths_in_list_order /
+    worktree_status / current_worktree_name_or_none / current_worktree_or_none)
+    are the seam FakeWtCtx duck-types in tests.
+
+    Worktrees are discovered from git's own registry, so one checked out
+    anywhere on disk — by wt, by another tool, or by hand — is recognized.
+    new_worktrees_dir only decides where wt puts the ones it creates."""
+
+    def __init__(self, git, layout, root, repo_dir, new_worktrees_dir, main_name):
+        self.git = git
+        self.layout = layout  # "bare" | "standard"
+        self.root = root
+        self.repo_dir = repo_dir
+        self.new_worktrees_dir = new_worktrees_dir
+        self.main_name = main_name
+        self.tabs = TabOpener()
+        self._registry_cache = None
+
+        head = git.origin_head()
+        origin_default = head.removeprefix("origin/") if head else ""
+        base = (git.config_chain("wt.baseBranch",
+                                 f"{gitcore.SHARED_SECTION}.baseBranch")
+                or origin_default or "main")
+        self.base_branch = base
+        self.base_ref = f"origin/{base}"
+        # A trunk branch never has a PR worth showing, so `wt list` renders it
+        # as no-PR rather than surfacing some long-dead PR that targeted it.
+        self.trunk_branches = {b for b in (base, origin_default) if b}
+
+        # Always protect .bare and the main worktree, on top of any
+        # user-configured names.
+        self.protected = git.config_chain_all(
+            "wt.protected", f"{gitcore.SHARED_SECTION}.protectedWorktrees")
+        if layout == "bare":
+            self.protected.append(".bare")
+        elif main_name:
+            self.protected.append(main_name)
+
+        # Branch prefix is resolved lazily — a missing user.email shouldn't
+        # break unrelated commands like `wt list`. The resolved flag guards the
+        # cache so an explicitly-empty prefix isn't mistaken for "not yet
+        # resolved".
+        self._prefix = ""
+        self._prefix_resolved = False
+
+    def _registry(self):
+        """{name: [path, ...]} over every worktree git has registered, keyed by
+        the folder's basename. Paths collect into a list because names are no
+        longer unique by construction — two worktrees in different parent
+        directories can share a basename. Built once per run; wt is one-shot."""
+        if self._registry_cache is None:
+            registry = {}
+            for path, _ in self.git.worktree_entries():
+                if path == self.root:
+                    # Bare layout's root is no worktree, so it has no name.
+                    name = self.main_name
+                else:
+                    name = os.path.basename(path)
+                    # Bare layout registers its own .bare dir, which holds no
+                    # checkout and isn't somewhere to work. Only linked
+                    # worktrees are filtered this way — the main worktree keeps
+                    # its name even in a dot-directory like ~/.dotfiles.
+                    if name.startswith("."):
+                        continue
+                if not name:
+                    continue
+                registry.setdefault(name, []).append(path)
+            self._registry_cache = registry
+        return self._registry_cache
+
+    def _rows(self):
+        """[(name, path)] in display order: the main worktree first in standard
+        layout, then by name and path. The single ordering both
+        list_worktree_names and worktree_paths_in_list_order read, so the two
+        can't drift out of alignment."""
+        rows = sorted((name, path)
+                      for name, paths in self._registry().items()
+                      for path in paths)
+        if self.layout == "standard":
+            rows.sort(key=lambda r: r[0] != self.main_name)
+        return rows
+
+    def list_worktree_names(self):
+        """Every worktree's name, in display order. A name shared by several
+        worktrees appears once per worktree, so `wt list` shows them all."""
+        return [name for name, _ in self._rows()]
+
+    def worktree_paths_in_list_order(self):
+        """Paths aligned with list_worktree_names(), so a duplicated name still
+        maps to distinct paths. Needed because worktree_path() refuses to
+        resolve an ambiguous name."""
+        return [path for _, path in self._rows()]
+
+    def worktree_path(self, name):
+        """Map name → absolute path. Dies if no worktree has that name, or if
+        several do — an ambiguous name has no single right answer, and silently
+        picking one risks acting on the wrong worktree."""
+        if not name:
+            die("worktree name required")
+        paths = self._registry().get(name)
+        if not paths:
+            die(f"no worktree named {name}")
+        if len(paths) > 1:
+            listed = "\n".join(f"    {p}" for p in sorted(paths))
+            die(f"ambiguous name {name} — {len(paths)} worktrees match:\n{listed}")
+        return paths[0]
+
+    def worktree_status(self, wt_path):
+        """(branch display, ahead count as str, dirty flag, remote ahead,
+        remote behind, has upstream).
+
+        Branch, dirty, and remote ahead/behind come from one
+        `git status -b --porcelain=v2`: its `# branch.*` headers give the branch
+        (or detached sha) and the `# branch.ab +A -B` upstream delta, and any
+        non-# line means the tree is dirty (tracked edits or untracked files).
+        With core.untrackedCache enabled this is markedly cheaper than scanning
+        the tree fresh each time."""
+        head, dirty, remote_ahead, remote_behind = None, 0, 0, 0
+        has_upstream = False
+        for line in self.git.status_v2_lines(wt_path):
+            if line.startswith("# branch.head "):
+                head = line[len("# branch.head "):]
+            elif line.startswith("# branch.ab "):
+                # "+A -B"; the header is present only when there's an upstream.
+                a, b = line[len("# branch.ab "):].split()
+                remote_ahead, remote_behind = int(a), -int(b)
+                has_upstream = True
+            elif line.startswith("#"):
+                pass
+            else:
+                dirty = 1  # any tracked/untracked change
+        if not head:
+            display = "?"
+        elif head == "(detached)":
+            display = f"{self.git.short_head(wt_path) or '?'} (detached)"
+        else:
+            display = head
+        # Ahead is measured against base_ref (the trunk), not the branch's own
+        # upstream, so it can't come from porcelain v2's `branch.ab`.
+        ahead = self.git.ahead_count(wt_path, self.base_ref)
+        return display, ahead, dirty, remote_ahead, remote_behind, has_upstream
+
+    def _registered_paths(self):
+        return {p for paths in self._registry().values() for p in paths}
+
+    def current_worktree_path(self):
+        top = self.git.toplevel()
+        if not top:
+            die("not inside a git worktree")
+        if top not in self._registered_paths():
+            die(f"cwd ({top}) is not a worktree of {self.root}")
+        return top
+
+    def current_worktree_name(self):
+        top = self.current_worktree_path()
+        if self.layout == "standard" and top == self.root:
+            return self.main_name
+        return os.path.basename(top)
+
+    def current_worktree_name_or_none(self):
+        """Non-dying twin of current_worktree_name, for `wt list`'s marker."""
+        return self.current_worktree_or_none()[0]
+
+    def current_worktree_or_none(self):
+        """(name, path) for the cwd's worktree, or (None, None). The path comes
+        straight from git rather than a name lookup, so this still answers
+        inside a worktree whose name it shares with another."""
+        top = self.git.toplevel()
+        if not top or top not in self._registered_paths():
+            return None, None
+        if self.layout == "standard" and top == self.root:
+            return self.main_name, top
+        return os.path.basename(top), top
+
+    def worktree_exists(self, name):
+        return name in self._registry()
+
+    def describe_existing(self, name):
+        """Where the worktree(s) claiming `name` actually are — the conflict may
+        sit outside new_worktrees_dir, so the path can't be assumed."""
+        return ", ".join(sorted(self._registry().get(name, [])))
+
+    def ensure_worktrees_dir(self):
+        """Standard layout: ensure the dir new worktrees go in exists and is
+        self-ignored."""
+        if self.layout != "standard":
+            return
+        os.makedirs(self.new_worktrees_dir, exist_ok=True)
+        gitignore = os.path.join(self.new_worktrees_dir, ".gitignore")
+        if not os.path.isfile(gitignore):
+            with open(gitignore, "w") as f:
+                f.write("*\n")
+
+
+def detect_ctx(git):
+    root = git.toplevel()
+    if root is None:
+        die("not inside a git repo")
+    common = git.common_dir(root)
+    if common is None:
+        die("failed to resolve git common dir")
+    # Make it absolute (--git-common-dir can be relative to cwd).
+    if not os.path.isabs(common):
+        common = os.path.join(root, common)
+    layout_root = os.path.dirname(common)
+    if os.path.basename(common) == ".bare":
+        git.repo_dir = common  # .bare dir — git -C anchor
+        return Ctx(git, "bare", layout_root,
+                   repo_dir=common,
+                   new_worktrees_dir=layout_root,  # new worktrees go here
+                   main_name="")                   # no main worktree in bare layout
+    # Git's common dir is <main-worktree>/.git, so dirname gives the main
+    # worktree regardless of which linked worktree we're invoked from.
+    git.repo_dir = layout_root  # main worktree doubles as the git -C anchor
+    return Ctx(git, "standard", layout_root,
+               repo_dir=layout_root,
+               new_worktrees_dir=os.path.join(layout_root, ".worktrees"),
+               main_name=os.path.basename(layout_root))
+
+
+# -------- helpers --------
+
+
+def _prefix_resolution(ctx):
+    """(ok, prefix). ok=False means user.email can't supply a default."""
+    if ctx._prefix_resolved:
+        return True, ctx._prefix
+    # The chain yields None only when neither key is set, so an explicit empty
+    # value (`git config wt.branchPrefix ""`) is honored as "no prefix" rather
+    # than falling through to the email-derived default.
+    cfg = ctx.git.config_chain("wt.branchPrefix",
+                               f"{gitcore.SHARED_SECTION}.branchPrefix")
+    if cfg is not None:
+        prefix = cfg
+    else:
+        email = ctx.git.config_get("user.email") or ""
+        local_part = email.split("@")[0]
+        if not email or local_part == email:
+            return False, None
+        prefix = local_part + "/"
+    ctx._prefix, ctx._prefix_resolved = prefix, True
+    return True, prefix
+
+
+def branch_prefix(ctx):
+    ok, prefix = _prefix_resolution(ctx)
+    if not ok:
+        die("can't derive wt.branchPrefix: git user.email is missing or has no '@'. "
+            "Run: git config wt.branchPrefix foo/ "
+            "(or `git config wt.branchPrefix \"\"` for no prefix)")
+    return prefix
+
+
+def branch_for(ctx, name, prefix=None):
+    """Add the branch prefix if it isn't already present. prefix=None resolves
+    the configured prefix; an explicit "" means "no prefix"."""
+    if prefix is None:
+        prefix = branch_prefix(ctx)
+    if prefix and name.startswith(prefix):
+        return name
+    return prefix + name
+
+
+def folder_for_branch(branch):
+    """Strip any leading "<prefix>/" so folder names stay prefix-agnostic —
+    both ryanmoelter/foo and cc/foo map to folder "foo". Any remaining slashes
+    get flattened to dashes so the folder stays one level deep
+    (cc/feature/thing → feature-thing)."""
+    return branch.split("/", 1)[-1].replace("/", "-")
+
+
+def resolve_branch(ctx, name):
+    """Resolve a checkout target to an existing local branch. Exact match
+    wins; otherwise fall back to a single branch ending in "/<name>" (so
+    `co wt` finds `ryanm/wt`). Dies listing the candidates when zero or more
+    than one suffix-match exists."""
+    if ctx.git.branch_exists(name):
+        return name
+    matches = [b for b in ctx.git.local_branches() if b.endswith("/" + name)]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        die(f"no such branch: {name} (use `wt co -b {name}` to create one)")
+    die(f"ambiguous branch: {name} matches {', '.join(matches)}; use the full name")
+
+
+def forge_kind(ctx):
+    """Which forge the PR column talks to: "github", "gitlab", or "none".
+    wt.forge overrides (escape hatch for self-hosted domains the host sniff
+    can't classify); otherwise sniffed from origin's URL host."""
+    return forge.forge_kind(
+        ctx.git.origin_url(),
+        ctx.git.config_chain("wt.forge", f"{gitcore.SHARED_SECTION}.forge"),
+    )
+
+
+def gitlab_fullpath(ctx):
+    """Project full path ("group/sub/repo") from origin's URL, for GraphQL's
+    project(fullPath:). None when unresolvable."""
+    return forge.gitlab_fullpath(ctx.git.origin_url())
+
+
+def display_location(wt_path, root):
+    """A worktree's directory for the `--paths` column: relative to the repo
+    root when it lives inside it (the common case, kept short), absolute
+    otherwise so a worktree checked out elsewhere stands out. The root itself
+    renders as "." — it has no relative form."""
+    if wt_path is None:
+        return ""
+    if wt_path == root:
+        return "."
+    if wt_path.startswith(root + "/"):
+        return os.path.dirname(wt_path[len(root) + 1:]) or "."
+    return os.path.dirname(wt_path)
+
+
+def path_for_branch(ctx, target):
+    """The worktree path that has branch `target` checked out, or None."""
+    for branch, wt_path in ctx.git.worktree_records():
+        if branch == target:
+            return wt_path
+    return None
+
+
+def usage(ctx):
+    # Signatures bold, trailing notes dim — the same styling `stack help` uses.
+    B, R, D = ui.BOLD, ui.RESET, ui.DIM
+    print(f"""{B}wt{R} — worktree helper
+
+usage: {B}wt <command> [args]{R}
+
+  {B}wt list|l        [--json] [--paths]{R}    show worktrees + statuses
+                                         {D}(incl. PR/MR status when gh/glab is installed;
+                                          --paths adds each worktree's directory){R}
+  {B}wt checkout|co   [-b] <branch> [--no-tab|--workspace]{R}
+                                         check out a branch in a new worktree; -b creates it
+  {B}wt cob           <branch> [--no-tab|--workspace]{R}
+                                         shorthand for `co -b` (create + check out)
+  {B}wt background|bg [name] [--no-tab|--workspace]{R}
+                                         move current branch+changes to a new worktree
+  {B}wt foreground|fg <name>{R}                move a worktree's branch+changes into current
+  {B}wt rename|r      [name] <new> [-f|--folder]{R}
+                                         rename branch; -f also renames the folder
+  {B}wt commit|cm     <name> [git-args...]{R}  commit -a in another worktree
+  {B}wt open|o        <name> [--workspace]{R}  open a worktree in a new terminal tab
+  {B}wt switch|s      <name|branch>{R}         cd to that worktree (via shell wrapper)
+  {B}wt path          <name|branch>{R}         print its path (scripts, other shells)
+  {B}wt current       [--json]{R}              report the cwd's worktree + branch
+  {B}wt delete|d      <name> [-f|--force]{R}   remove worktree (branch left intact)
+  {B}wt prune|p       [-y|--yes]{R}            delete worktrees whose PR/MR is merged or closed
+  {B}wt setup{R}                               interactively configure ryanmoelter-cli-tools.*
+  {B}wt init zsh{R}                            print shell integration for eval in .zshrc
+  {B}wt help{R}                                show this message
+
+Tab flags: by default a tab opens in the current cmux workspace (a Ghostty
+tab outside cmux). --no-tab opens nothing; --workspace opens a whole new cmux
+workspace instead (no effect outside cmux).""")
+
+    # Resolved config summary. branch_prefix can fail (missing user.email) —
+    # fall back to a placeholder so `wt -h` still succeeds on fresh clones.
+    ok, prefix = _prefix_resolution(ctx)
+    if ok:
+        resolved_branch_prefix = prefix if prefix else "(none — no prefix)"
+    else:
+        resolved_branch_prefix = "(unset: git user.email missing)"
+
+    protected_display = ", ".join(ctx.protected) if ctx.protected else "(none)"
+    untracked_cache = ctx.git.config_get("core.untrackedCache") or ""
+
+    kind = forge_kind(ctx)
+    icon = {"github": ui.SYM_GITHUB, "gitlab": ui.SYM_GITLAB}.get(kind, "")
+    print()
+    print("\n".join(ui.glyph_key(
+        forge_icon=icon, num_prefix="!" if kind == "gitlab" else "#")))
+
+    shared = gitcore.SHARED_SECTION
+    nerd = ctx.git.config_chain_bool("wt.nerdFont", f"{shared}.nerdFont")
+    ignored = ctx.git.config_chain_all(
+        "wt.ignoredPendingChecks", f"{shared}.ignoredPendingChecks")
+
+    print(f"""
+Current config (resolved), set via `wt setup` or `git config {shared}.*`:
+  baseBranch           {ctx.base_branch}
+  branchPrefix         {resolved_branch_prefix}
+  forge                {kind}
+  nerdFont             {"yes" if nerd else "no"}
+  protectedWorktrees   {protected_display}
+  ignoredPendingChecks {f"{len(ignored)} check(s)" if ignored else "(none)"}
+  core.untrackedCache  {untracked_cache or "(unset — `wt setup` can enable; speeds up `wt list`)"}""")
+
+
+# -------- PR status --------
+#
+# `wt list` decorates each branch with its PR/MR status via one GraphQL call —
+# gh or glab per the forge (see forge_kind) — started on a background thread
+# before the local status scan, so the network round trip is hidden behind
+# work we're doing anyway. Soft dependency: no forge CLI, or a failed call
+# (offline, unauthed, unrecognized remote) simply omits the column.
+
+
+def start_pr_fetch(ctx):
+    """Kick off the PR fetch on a daemon thread. → (done event, result box,
+    number prefix, forge icon) or None when there's nothing to fetch. The box
+    holds "prs": {branch: pr|None} on success, or None on failure."""
+    kind = forge_kind(ctx)
+    if kind == "github":
+        if not shutil.which("gh"):
+            return None
+        fetch = lambda branches: fetch_github_prs(branches, cwd=ctx.repo_dir)  # noqa: E731
+        num_prefix, forge_icon = "#", ui.SYM_GITHUB
+    elif kind == "gitlab":
+        if not shutil.which("glab"):
+            return None
+        fullpath = gitlab_fullpath(ctx)
+        if not fullpath:
+            return None
+        fetch = lambda branches: fetch_gitlab_prs(fullpath, branches, cwd=ctx.repo_dir)  # noqa: E731
+        num_prefix, forge_icon = "!", ui.SYM_GITLAB
+    else:
+        return None
+
+    # Asking only for our checked-out branches keeps the query small enough to
+    # be fast (`gh pr list` with statusCheckRollup 504s on repos with big PR
+    # histories).
+    branches = [b for b, _ in ctx.git.worktree_records()]
+    if not branches:
+        return None
+
+    done, box = start_fetch(fetch, branches)
+    return done, box, num_prefix, forge_icon
+
+
+# -------- list --------
+
+
+def status_cluster(ahead, dirty, remote_ahead=0, remote_behind=0):
+    """Plain (uncolored) "↗<ahead> ↑<ra> ↓<rb> +" cluster for a row, in that
+    order — ahead of parent (the trunk), ahead/behind the remote, then dirty.
+    The colored version embeds ANSI escapes, which break width math, so
+    alignment is computed from this twin instead."""
+    parts = []
+    if ahead and ahead != "0":
+        parts.append(f"{ui.SYM_AHEAD}{ahead}")
+    if remote_ahead:
+        parts.append(f"{ui.SYM_UP}{remote_ahead}")
+    if remote_behind:
+        parts.append(f"{ui.SYM_DOWN}{remote_behind}")
+    if dirty:
+        parts.append("+")
+    return " ".join(parts)
+
+
+def build_rows(ctx):
+    """[(name, branch display, ahead, dirty, remote ahead, remote behind,
+    has upstream)] for every worktree.
+
+    The base branch's own row drops its ahead-of-base count — it's measured
+    against the base ref, so on the base branch it just re-counts unpushed
+    commits the ahead-of-remote (↑) column already shows."""
+    rows = []
+    names = ctx.list_worktree_names()
+    # Paths come from the parallel list, not worktree_path(name): a name shared
+    # by two worktrees is ambiguous by name but still has one path per row.
+    paths = ctx.worktree_paths_in_list_order()
+    for name, wt_path in zip(names, paths):
+        display, ahead, dirty, remote_ahead, remote_behind, has_upstream = (
+            ctx.worktree_status(wt_path)
+        )
+        if display == ctx.base_branch:
+            ahead = ""
+        rows.append((name, display, ahead, dirty, remote_ahead, remote_behind,
+                     has_upstream))
+    return rows
+
+
+def prune_candidates(records, prs, protected, cwd_name, base_branch):
+    """records: [(branch, wt_path)] from git.worktree_records(). → the subset
+    [(name, branch, wt_path, pr)] whose PR/MR is MERGED or CLOSED, excluding
+    protected worktrees, the cwd worktree, and the base branch.
+
+    name is the path's basename, used only to describe and protect the
+    candidate; deletion goes by path, so a name shared with another worktree
+    can't cause the wrong one to be removed."""
+    out = []
+    for branch, wt_path in records:
+        name = os.path.basename(wt_path)
+        if name in protected or name == cwd_name or branch == base_branch:
+            continue
+        pr = prs.get(branch)
+        if pr and pr["state"] in ("MERGED", "CLOSED"):
+            out.append((name, branch, wt_path, pr))
+    return out
+
+
+def colorize_cluster(plain):
+    """Colorize a status_cluster() twin per the shared vocabulary: ↗ (ahead of
+    parent) dim, ↑/↓ (ahead/behind remote) green, + (dirty) green."""
+    if not plain:
+        return ""
+    color = {ui.SYM_AHEAD: ui.DIM, ui.SYM_UP: ui.GREEN,
+             ui.SYM_DOWN: ui.GREEN, "+": ui.GREEN}
+    return " ".join(f"{color[seg[0]]}{seg}{ui.RESET}" for seg in plain.split(" "))
+
+
+# Long worktree and branch names are truncated to this many columns (with an
+# ellipsis) so a stray long name can't blow out the table width.
+_NAME_MAX = 40
+
+
+def _truncate(s, cap):
+    """s clipped to cap visible columns, last char an ellipsis when clipped."""
+    if len(s) <= cap:
+        return s
+    return s[: cap - 1] + "…" if cap >= 1 else ""
+
+
+def render_list(rows, cwd_name, pr_state, pr_by_branch, num_prefix, forge_icon=None,
+                trunk_branches=(), dirs=None):
+    """The `wt list` table. pr_state: "on" (render per-branch), "loading" (fetch
+    still in flight → dim ellipsis chip), "wait" (timed out → dim net-off chip),
+    "error" (fetch failed → red net-off chip), or "off" (no forge CLI → column
+    omitted). Branches in trunk_branches render as no-PR, and a branch with no
+    upstream renders local-only in every state but "off" — the forge can't have
+    a PR for a branch it has never seen. Long worktree and branch names are
+    truncated to _NAME_MAX.
+
+    dirs: display locations parallel to rows (`wt list --paths`), appended as a
+    trailing dim column. Returns the rendered text (no trailing newline)."""
+    name_disp = [_truncate(name, _NAME_MAX) for name, *_ in rows]
+    max_name = max(len(n) for n in name_disp)
+
+    def field_width(branch, plain):
+        """Visible width of the "<branch>  <cluster>" field (no cluster → just
+        the branch, no trailing space)."""
+        return len(branch) + (2 + len(plain) if plain else 0)
+
+    # The status cluster rides just after the (truncated) branch name in one
+    # shared field, widened to the longest such pair.
+    disp = {branch: _truncate(branch, _NAME_MAX)
+            for _, branch, *_ in rows}
+    max_branch_status = max(
+        field_width(disp[branch], status_cluster(a, d, ra, rb))
+        for _, branch, a, d, ra, rb, _ in rows
+    )
+
+    lines = []
+    for i, (name, branch_disp, ahead, dirty, remote_ahead, remote_behind,
+            has_upstream) in enumerate(rows):
+        marker = "→" if name == cwd_name else " "
+        branch_name = disp[branch_disp]
+        plain = status_cluster(ahead, dirty, remote_ahead, remote_behind)
+        colored = colorize_cluster(plain)
+        branch_status = f"{branch_name}  {colored}" if plain else branch_name
+        # Pad by the plain field width — the colored cluster's ANSI escapes
+        # would otherwise skew str formatting widths.
+        pad = " " * (max_branch_status - field_width(branch_name, plain))
+
+        if not has_upstream and pr_state != "off":
+            # A branch that was never pushed can't have a PR, so the fetch has
+            # nothing to say about it — render local-only in every state rather
+            # than showing it as loading or unavailable.
+            pr_str = branch_pr_chip(None, False, forge_icon, num_prefix)[0]
+        elif pr_state == "on":
+            pr = None if branch_disp in trunk_branches else pr_by_branch.get(branch_disp)
+            pr_str = branch_pr_chip(pr, has_upstream, forge_icon, num_prefix)[0]
+        elif pr_state == "loading":
+            pr_str = pr_loading_chip(forge_icon)[0]
+        elif pr_state == "wait":
+            pr_str = pr_net_off_chip(forge_icon, failed=False)[0]
+        elif pr_state == "error":
+            pr_str = pr_net_off_chip(forge_icon, failed=True)[0]
+        else:
+            pr_str = ""
+
+        line = f"{marker} {name_disp[i]:<{max_name}}  {branch_status}{pad}  {pr_str}"
+        if dirs:
+            line = f"{line.rstrip()}  {ui.DIM}{dirs[i]}{ui.RESET}"
+        if name == cwd_name:
+            # Bold the whole row. Interior segments end in ui.RESET (which also
+            # clears bold), so re-arm bold after each one.
+            line = f"{ui.BOLD}{line.replace(ui.RESET, ui.RESET + ui.BOLD)}{ui.RESET}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def redraw_prefix(n_lines):
+    """ANSI to rewind over an n_lines-tall block already printed: cursor up,
+    then clear from there to the end of the screen."""
+    return f"\033[{n_lines}A\033[J"
+
+
+def build_list_json(rows, cwd_name, pr_state, pr_by_branch, paths, trunk_branches=()):
+    """The `wt list --json` payload: {"pr_state", "worktrees": [...]}.
+
+    Pure twin of render_list, for machine consumers (the Sublime plugin). Each
+    worktree carries its absolute path, which the plain table omits unless
+    --paths is passed. paths runs parallel to rows rather than being keyed by
+    name, since names are not unique. pr_state rides at the top level so a
+    consumer can tell "no PR" (pr: null under state "on") from "PR status
+    unavailable" (any other state)."""
+    worktrees = []
+    for i, (name, branch, ahead, dirty, remote_ahead, remote_behind,
+            has_upstream) in enumerate(rows):
+        pr = None
+        if pr_state == "on" and branch not in trunk_branches:
+            pr = pr_by_branch.get(branch)
+        worktrees.append({
+            "name": name,
+            "path": paths[i] if i < len(paths) else None,
+            "branch": branch,
+            "current": name == cwd_name,
+            # build_rows blanks the base branch's ahead count; "" → 0 so the
+            # field is always a number.
+            "ahead": int(ahead) if ahead else 0,
+            "dirty": bool(dirty),
+            "remote_ahead": remote_ahead,
+            "remote_behind": remote_behind,
+            "has_upstream": has_upstream,
+            "pr": {
+                "number": pr["number"],
+                "state": pr["state"],
+                "is_draft": pr.get("isDraft", False),
+                "url": pr.get("url"),
+                "title": pr.get("title"),
+            } if pr else None,
+        })
+    return {"pr_state": pr_state, "worktrees": worktrees}
+
+
+# A GUI consumer can afford to wait longer than the interactive table for PR
+# status; showing it is better than reporting "wait" and rendering no column.
+_JSON_PR_WAIT = 3.0
+
+# The table paints the local state immediately and never waits on the forge, so
+# the fetch gets a budget well past what a blocking wait could afford.
+_LIST_PR_TOTAL = 8.0
+
+
+def _resolve_pr_state(box):
+    """A finished fetch's result box → (pr_state, pr_by_branch)."""
+    prs = box.get("prs")
+    return ("on", prs) if prs is not None else ("error", {})
+
+
+def print_list_live(rows, cwd_name, fetch, trunk_branches, live, dirs=None):
+    """Print the list table, filling in the PR column as the fetch lands.
+
+    On a TTY the local table paints immediately with dim loading chips, redrawn
+    in place once the fetch resolves (or the budget runs out). Off a TTY there is
+    nothing to redraw into, so block for the whole budget and print once — a
+    piped consumer never has to skip a stale frame."""
+    if fetch is None:
+        print(render_list(rows, cwd_name, "off", {}, "#", None, trunk_branches, dirs))
+        return
+
+    done, box, num_prefix, forge_icon = fetch
+
+    def table(pr_state, pr_by_branch):
+        return render_list(rows, cwd_name, pr_state, pr_by_branch, num_prefix,
+                           forge_icon, trunk_branches, dirs)
+
+    def collect(timeout):
+        return _resolve_pr_state(box) if done.wait(timeout) else ("wait", {})
+
+    if not live:
+        print(table(*collect(_LIST_PR_TOTAL)))
+        return
+
+    provisional = table("loading", {})
+    print(provisional)
+    resolved = table(*collect(_LIST_PR_TOTAL))
+    sys.stdout.write(redraw_prefix(provisional.count("\n") + 1))
+    print(resolved)
+
+
+def cmd_list(ctx, argv):
+    as_json, show_paths = False, False
+    for a in argv:
+        if a == "--json":
+            as_json = True
+        elif a in ("--paths", "--dirs"):
+            show_paths = True
+        else:
+            die(f"list: unknown flag: {a}")
+
+    # Start the PR fetch first so it overlaps the per-worktree status scan.
+    fetch = start_pr_fetch(ctx)
+
+    cwd_name = ctx.current_worktree_name_or_none()
+    rows = build_rows(ctx)
+    if not rows:
+        if as_json:
+            print(json.dumps({"pr_state": "off", "worktrees": []}))
+        else:
+            print(f"wt: no worktrees for {ctx.root}")
+        return
+
+    if as_json:
+        # A single blocking wait: the payload is parsed, not watched, so there is
+        # nothing to fill in later. On timeout the daemon thread is abandoned.
+        pr_state, pr_by_branch = "off", {}
+        if fetch is not None:
+            done, box, _, _ = fetch
+            pr_state, pr_by_branch = (_resolve_pr_state(box)
+                                      if done.wait(_JSON_PR_WAIT) else ("wait", {}))
+        print(json.dumps(build_list_json(rows, cwd_name, pr_state, pr_by_branch,
+                                         ctx.worktree_paths_in_list_order(),
+                                         ctx.trunk_branches)))
+        return
+
+    dirs = None
+    if show_paths:
+        dirs = [display_location(p, ctx.root)
+                for p in ctx.worktree_paths_in_list_order()]
+    print_list_live(rows, cwd_name, fetch, ctx.trunk_branches, sys.stdout.isatty(),
+                    dirs)
+
+
+# -------- subcommands --------
+
+
+def cmd_checkout(ctx, argv, create=False):
+    """Check out a branch in a new worktree. Bare `co <branch>` checks out an
+    existing branch — exact name, or a unique "<prefix>/<branch>" suffix match
+    (so `co wt` finds `ryanm/wt`). `co -b <name>` creates a new branch off the
+    base, adding the configured prefix only if <name> has none."""
+    open_tab, workspace, name = True, False, ""
+    for a in argv:
+        if a == "-b":
+            create = True
+        elif a == "--no-tab":
+            open_tab = False
+        elif a == "--workspace":
+            workspace = True
+        # --surface was the opt-in for what is now the default.
+        elif a == "--surface":
+            pass
+        elif a.startswith("-"):
+            die(f"unknown flag: {a}")
+        else:
+            if name:
+                die("too many arguments")
+            name = a
+
+    if not name:
+        if create:
+            die("checkout: branch name required (e.g. `wt co -b my-feature`)")
+        die("checkout: branch name required (e.g. `wt co some-branch`, or `wt co -b` to create)")
+
+    if create:
+        branch = branch_for(ctx, name)
+    else:
+        branch = resolve_branch(ctx, name)
+        if branch != name:
+            print(f"wt: matched {name} → {branch}")
+    folder = folder_for_branch(branch)
+    wt_path = os.path.join(ctx.new_worktrees_dir, folder)
+
+    if ctx.worktree_exists(folder):
+        die(f"worktree already exists: {ctx.describe_existing(folder)}")
+
+    ctx.ensure_worktrees_dir()
+
+    if create:
+        if ctx.git.branch_exists(branch):
+            die(f"branch already exists: {branch} (use `wt co {branch}` to check it out)")
+        print(f"wt: fetching {ctx.base_ref}...")
+        ctx.git.fetch_base(ctx.base_branch)
+        # --no-track: start at the base ref but don't set it as upstream; we
+        # want the branch independent so pushes create a new remote branch.
+        ctx.git.worktree_add(wt_path, branch, new=True, base_ref=ctx.base_ref)
+        print(f"wt: created {wt_path} ({branch})")
+    else:
+        # git refuses if the branch is already checked out elsewhere.
+        ctx.git.worktree_add(wt_path, branch)
+        print(f"wt: created {wt_path} (checked out {branch})")
+
+    ctx.git.enable_untracked_cache(wt_path)
+
+    if open_tab:
+        ctx.tabs.open(wt_path, workspace=workspace)
+
+
+def cmd_open(ctx, argv):
+    workspace, name = False, ""
+    for a in argv:
+        if a == "--workspace":
+            workspace = True
+        elif a == "--surface":
+            pass
+        elif a.startswith("-"):
+            die(f"unknown flag: {a}")
+        else:
+            if name:
+                die("too many arguments")
+            name = a
+    wt_path = ctx.worktree_path(name)
+    ctx.tabs.open(wt_path, workspace=workspace)
+
+
+def cmd_background(ctx, argv):
+    """Relocate the current worktree's branch + uncommitted work into a new
+    worktree, leaving the current one on the base branch."""
+    open_tab, workspace, name = True, False, ""
+    for a in argv:
+        if a == "--no-tab":
+            open_tab = False
+        elif a == "--workspace":
+            workspace = True
+        elif a == "--surface":
+            pass
+        elif a.startswith("-"):
+            die(f"unknown flag: {a}")
+        else:
+            if name:
+                die("too many arguments")
+            name = a
+
+    cwd_path = ctx.current_worktree_path()
+    cwd_name = os.path.basename(cwd_path)
+    orig_branch = ctx.git.branch_of(cwd_path)
+
+    clean = ctx.git.is_clean(cwd_path)
+    if clean and orig_branch == ctx.base_branch:
+        die(f"nothing to move: {cwd_name} is clean and on {ctx.base_branch} (use `wt co -b` instead)")
+
+    # Resolve the branch prefix up front — see cmd_checkout.
+    prefix = branch_prefix(ctx)
+
+    # Pick a name if none given: the prefix-less branch name (ryanm/wt → wt,
+    # cc/foo/bar → foo-bar, spike → spike) via the same folder-naming rule
+    # used below. A clean base branch is already rejected above, so any branch
+    # we get here yields a usable name; a folder collision still errors below.
+    if not name:
+        name = folder_for_branch(orig_branch)
+
+    # Destination folder: normalize the name through branch_for (which adds
+    # the configured branch prefix unless one is already present) and then
+    # feed it through folder_for_branch so the folder-naming rule is applied
+    # once, in one place. This works for both the reuse path (orig_branch kept
+    # as-is) and the fresh-branch path, since the folder name is independent
+    # of the branch's prefix.
+    new_folder = folder_for_branch(branch_for(ctx, name, prefix))
+    new_wt_path = os.path.join(ctx.new_worktrees_dir, new_folder)
+    if ctx.worktree_exists(new_folder):
+        die(f"worktree already exists: {ctx.describe_existing(new_folder)} "
+            "(pass a different name: `wt bg <name>`)")
+
+    ctx.ensure_worktrees_dir()
+
+    # Stash uncommitted changes (if any) with a recognizable message.
+    stashed = False
+    if not clean:
+        print(f"wt: stashing changes in {cwd_name}...")
+        ctx.git.stash_push(cwd_path, f"wt move from {cwd_name} {int(time.time())}")
+        stashed = True
+
+    if orig_branch != ctx.base_branch:
+        # The new worktree takes the branch and the current worktree moves to
+        # the base branch.
+        print(f"wt: moving {orig_branch} out of {cwd_name}...")
+        # Detach first so the branch is free to be checked out elsewhere.
+        ctx.git.checkout_fatal(cwd_path, orig_branch, detach=True)
+        if not ctx.git.worktree_add(new_wt_path, orig_branch, fatal=False):
+            # Recovery: reattach the branch in the current worktree and
+            # restore the stash. Track both so the error message is honest.
+            reattach_ok = ctx.git.checkout_ok(cwd_path, orig_branch)
+            pop_ok = ctx.git.stash_pop_ok(cwd_path, silent=True) if stashed else True
+            if reattach_ok and pop_ok:
+                die(f"failed to create new worktree; state restored in {cwd_name}")
+            elif reattach_ok:
+                die(f"failed to create new worktree; branch reattached in {cwd_name} "
+                    "but stash pop failed — see `git stash list`")
+            elif pop_ok:
+                die(f"failed to create new worktree; reattach of {orig_branch} failed — "
+                    f"{cwd_name} is left detached")
+            else:
+                die(f"failed to create new worktree AND recovery failed: {cwd_name} detached, "
+                    "stash still in `git stash list`")
+        # Move current onto the base branch. If it's checked out in another
+        # worktree, fall back to a detached checkout at the base ref.
+        ctx.git.fetch_base(ctx.base_branch, quiet=True)
+        if ctx.git.checkout_ok(cwd_path, ctx.base_branch):
+            print(f"wt: {cwd_name} now on {ctx.base_branch}")
+        else:
+            ctx.git.checkout_fatal(cwd_path, ctx.base_ref, detach=True)
+            print(f"wt: {cwd_name} now at {ctx.base_ref} (detached; "
+                  f"{ctx.base_branch} is checked out elsewhere)")
+    else:
+        # Current is on the base branch: create a fresh prefixed branch in the
+        # new worktree.
+        print("wt: creating new branch for moved changes...")
+        new_branch = branch_for(ctx, name, prefix)
+        if ctx.git.branch_exists(new_branch):
+            die(f"branch already exists: {new_branch}")
+        ctx.git.fetch_base(ctx.base_branch, quiet=True)
+        if not ctx.git.worktree_add(new_wt_path, new_branch, new=True,
+                                    base_ref=ctx.base_ref, fatal=False):
+            pop_ok = ctx.git.stash_pop_ok(cwd_path, silent=True) if stashed else True
+            if pop_ok:
+                die(f"failed to create new worktree; stash restored in {cwd_name}")
+            die("failed to create new worktree; stash pop failed — see `git stash list`")
+
+    # Pop the stash in the new worktree. If it conflicts, leave it in the list.
+    if stashed:
+        print(f"wt: restoring changes in {new_folder}...")
+        if not ctx.git.stash_pop_ok(new_wt_path):
+            print(f"wt: stash pop had conflicts in {new_wt_path}; the stash is still in "
+                  "`git stash list`", file=sys.stderr)
+
+    print(f"wt: moved to {new_wt_path}")
+
+    ctx.git.enable_untracked_cache(new_wt_path)
+
+    if open_tab:
+        ctx.tabs.open(new_wt_path, workspace=workspace)
+
+
+def cmd_delete(ctx, argv):
+    force, name = False, ""
+    for a in argv:
+        if a in ("-f", "--force"):
+            force = True
+        elif a.startswith("-"):
+            die(f"unknown flag: {a}")
+        else:
+            if name:
+                die("too many arguments")
+            name = a
+
+    if not name:
+        die("worktree name required")
+    if name in ctx.protected:
+        die(f"refusing to delete protected worktree: {name}")
+
+    wt_path = ctx.worktree_path(name)
+    branch = ctx.git.branch_of(wt_path)
+
+    if not force and not ctx.git.is_clean(wt_path):
+        die(f"{name} has uncommitted changes (use -f to force)")
+
+    ctx.git.worktree_remove(wt_path, force=force)
+    print(f"wt: deleted worktree {name} (branch {branch} left intact)")
+
+
+def cmd_prune(ctx, argv):
+    auto_yes = False
+    for a in argv:
+        if a in ("-y", "--yes"):
+            auto_yes = True
+        else:
+            die(f"unknown flag: {a}")
+
+    fetch = start_pr_fetch(ctx)
+    if fetch is None:
+        die("prune needs PR/MR status — no forge configured or gh/glab missing")
+    done, box, num_prefix, forge_icon = fetch
+    done.wait(30)  # prune is deliberate; block for the fetch, don't time out at 1s
+    prs = box.get("prs")
+    if prs is None:
+        die("could not fetch PR/MR status; aborting prune")
+
+    cwd_name = ctx.current_worktree_name_or_none()
+    candidates = prune_candidates(
+        ctx.git.worktree_records(), prs, ctx.protected, cwd_name, ctx.base_branch
+    )
+    if not candidates:
+        print("wt: nothing to prune")
+        return
+
+    skipped = []
+    for name, branch, wt_path, pr in candidates:
+        chip = pr_chip(pr, num_prefix, forge_icon)[0]
+        if not ctx.git.is_clean(wt_path):
+            skipped.append(name)
+            print(f"  skip {name}  {chip}  (uncommitted changes)")
+            continue
+        if not auto_yes:
+            reply = _read_reply(f"  delete {name} ({branch})  {chip}? [y/N]> ").strip()
+            if reply not in ("y", "Y", "yes", "YES"):
+                continue
+        ctx.git.worktree_remove(wt_path)
+        ctx.git.branch_delete(branch, force=True)
+        print(f"wt: deleted worktree {name} and branch {branch}")
+
+    if skipped:
+        print(f"wt: skipped (uncommitted changes): {', '.join(skipped)}")
+
+
+def cmd_rename(ctx, argv):
+    rename_folder, positional = False, []
+    for a in argv:
+        if a in ("-f", "--folder"):
+            rename_folder = True
+        elif a.startswith("-"):
+            die(f"unknown flag: {a}")
+        else:
+            positional.append(a)
+
+    if len(positional) == 1:
+        target_name, new_name = ctx.current_worktree_name(), positional[0]
+    elif len(positional) == 2:
+        target_name, new_name = positional
+    else:
+        die("rename: usage: wt rename [name] <new-name> [-f|--folder]")
+
+    if target_name in ctx.protected:
+        die(f"refusing to rename protected worktree: {target_name}")
+
+    old_path = ctx.worktree_path(target_name)
+    old_branch = ctx.git.branch_of(old_path)
+    # A detached worktree reports "HEAD" and has no branch to rename; the
+    # folder move is still worth doing on its own.
+    detached = old_branch in (None, "HEAD")
+    new_branch = branch_for(ctx, new_name)
+    new_folder = folder_for_branch(new_branch)
+    new_path = os.path.join(ctx.new_worktrees_dir, new_folder)
+
+    if detached and not rename_folder:
+        die(f"{target_name} is detached — nothing to rename "
+            "(pass -f to move its folder)")
+    if not detached:
+        if old_branch == new_branch:
+            die(f"branch is already {old_branch}")
+        if ctx.git.branch_exists(new_branch):
+            die(f"branch already exists: {new_branch}")
+
+    # Do the folder move first (unreversible) so we only rename the branch if
+    # the filesystem operation succeeded. A partial failure then leaves the
+    # branch name unchanged, which is easy to retry.
+    if rename_folder and old_path != new_path:
+        if ctx.worktree_exists(new_folder):
+            die(f"worktree already exists: {ctx.describe_existing(new_folder)}")
+        ctx.git.worktree_move(old_path, new_path)
+        print(f"wt: moved worktree folder → {new_path}")
+        old_path = new_path
+
+    if detached:
+        return
+    ctx.git.branch_move(old_path, old_branch, new_branch)
+    print(f"wt: renamed branch {old_branch} → {new_branch}")
+
+
+def cmd_commit(ctx, argv):
+    name = argv[0] if argv else ""
+    if not name:
+        die("commit: worktree name required (use plain `git commit` for the current one)")
+    wt_path = ctx.worktree_path(name)
+    rc = ctx.git.commit_a(wt_path, argv[1:])
+    if rc != 0:
+        sys.exit(rc)
+
+
+def cmd_path(ctx, argv):
+    name = argv[0] if argv else ""
+    if not name:
+        die("path: worktree name or branch required")
+    # Prefer a matching worktree folder; fall back to a checked-out branch name.
+    if ctx.worktree_exists(name):
+        wt_path = ctx.worktree_path(name)
+    else:
+        wt_path = path_for_branch(ctx, name)
+        if wt_path is None:
+            die(f"no worktree or checked-out branch matching: {name}")
+    print(wt_path)
+
+
+def cmd_switch(ctx, argv):
+    die('switch needs a shell wrapper to cd this shell, which a subprocess '
+        'cannot do. Add to ~/.zshrc:\n\n  eval "$(wt init zsh)"\n\n'
+        "Then reload. For a plain path (scripts, other shells), use "
+        "`wt path`.")
+
+
+def cmd_current(ctx, argv):
+    """Report the cwd's worktree. Unlike the other cwd-sensitive commands this
+    never dies on a cwd outside a wt-managed worktree — the Sublime status bar
+    polls it for arbitrary files, where "not a worktree" is a normal answer."""
+    as_json = False
+    for a in argv:
+        if a == "--json":
+            as_json = True
+        else:
+            die(f"current: unknown flag: {a}")
+
+    name, path = ctx.current_worktree_or_none()
+    branch = ctx.git.branch_of(path) if path else None
+
+    if as_json:
+        print(json.dumps({"worktree": name, "branch": branch, "path": path,
+                          "root": ctx.root, "layout": ctx.layout}))
+    elif name:
+        print(f"{name}  {branch}")
+    else:
+        print("wt: not in a wt-managed worktree", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_foreground(ctx, argv):
+    name = argv[0] if argv else ""
+    if not name:
+        die("foreground: worktree name required")
+
+    cwd_path = ctx.current_worktree_path()
+    cwd_name = os.path.basename(cwd_path)
+    source_path = ctx.worktree_path(name)
+
+    if cwd_path == source_path:
+        die("checkout: that's the current worktree")
+    if name in ctx.protected:
+        die(f"refusing to consume protected worktree: {name}")
+
+    if not ctx.git.is_clean(cwd_path):
+        die(f"current worktree ({cwd_name}) has uncommitted changes")
+
+    source_branch = ctx.git.branch_of(source_path)
+
+    # If the source has uncommitted changes, stash them (with untracked) so we
+    # can pop them after checking out the branch here. Inverse of `background`.
+    stashed = False
+    if not ctx.git.is_clean(source_path):
+        print(f"wt: stashing changes in {name}...")
+        ctx.git.stash_push(source_path, f"wt checkout from {name} {int(time.time())}")
+        stashed = True
+
+    # Reversible step first: detach the source worktree so its branch is free,
+    # then do the checkout here. Only remove the source if the checkout succeeds.
+    ctx.git.checkout_fatal(source_path, source_branch, detach=True, quiet_stdout=False)
+    if not ctx.git.checkout_ok(cwd_path, source_branch, silent=False):
+        # Recovery: reattach the branch in source and pop the stash back there.
+        reattach_ok = ctx.git.checkout_ok(source_path, source_branch)
+        pop_ok = ctx.git.stash_pop_ok(source_path, silent=True) if stashed else True
+        if reattach_ok and pop_ok:
+            die(f"checkout {source_branch} failed; source worktree {name} left intact")
+        elif reattach_ok:
+            die(f"checkout {source_branch} failed; source worktree {name} left intact, "
+                "but stash pop failed — see `git stash list`")
+        elif pop_ok:
+            die(f"checkout {source_branch} failed; reattach in {name} also failed — "
+                f"{name} is left detached")
+        else:
+            die(f"checkout {source_branch} failed AND recovery failed: {name} detached, "
+                "stash still in `git stash list`")
+
+    if stashed:
+        print(f"wt: restoring changes in {cwd_name}...")
+        if not ctx.git.stash_pop_ok(cwd_path):
+            print(f"wt: stash pop had conflicts in {cwd_path}; the stash is still in "
+                  "`git stash list`", file=sys.stderr)
+
+    ctx.git.worktree_remove(source_path)
+    print(f"wt: checked out {source_branch} in {cwd_name} (removed {name})")
+
+
+def cmd_complete(ctx, argv):
+    gitcore.set_quiet(True)
+    what = argv[0] if argv else ""
+    if what == "worktrees":
+        for name in ctx.list_worktree_names():
+            print(name)
+    elif what == "branches":
+        for branch, _ in ctx.git.worktree_records():
+            print(branch)
+    elif what == "checkoutable":
+        # Local branches NOT already checked out in a worktree — the set that
+        # `wt co <branch>` will actually accept.
+        in_worktree = {branch for branch, _ in ctx.git.worktree_records()}
+        for branch in ctx.git.local_branches():
+            if branch not in in_worktree:
+                print(branch)
+
+
+# -------- setup --------
+
+
+def _read_reply(prompt):
+    try:
+        return input(prompt)
+    except EOFError:
+        sys.exit(1)
+
+
+def _setup_string(ctx, key, desc, current, global_scope, allow_empty=False):
+    """Prompt for a single-valued string config. "-" unsets, empty keeps
+    current."""
+    print(key)
+    print(f"  {desc}")
+    print(f"  current: {current or '(unset)'}")
+    reply = _read_reply("  new value> ")
+    if not reply:
+        print("  (unchanged)")
+    elif reply == "-":
+        ctx.git.config_unset(key, global_scope=global_scope)
+        print("  unset.")
+    elif allow_empty and reply in ("''", '""'):
+        # Explicit empty: distinct from blank input (keep current) and "-" (unset).
+        ctx.git.config_set(key, "", global_scope=global_scope)
+        print("  set: (empty — no prefix)")
+    else:
+        ctx.git.config_set(key, reply, global_scope=global_scope)
+        print(f"  set: {reply}")
+    print()
+
+
+def _setup_multi(ctx, key, desc, global_scope, current):
+    """Prompt for a multi-valued config (git config --add). The new value
+    replaces the prior list on that scope. "-" unsets all; empty keeps
+    current."""
+    print(key)
+    print(f"  {desc}")
+    print(f"  current: {', '.join(current) if current else '(none)'}")
+    reply = _read_reply("  new values (space-separated)> ")
+    if not reply:
+        print("  (unchanged)")
+        print()
+        return
+    ctx.git.config_unset(key, global_scope=global_scope, all_values=True)
+    if reply == "-":
+        print("  unset.")
+        print()
+        return
+    tokens = reply.split()
+    for t in tokens:
+        ctx.git.config_add(key, t, global_scope=global_scope)
+    print(f"  set: {', '.join(tokens)}")
+    print()
+
+
+def _setup_bool(ctx, key, desc, current, global_scope):
+    """Prompt for a boolean config. "-" unsets, empty keeps current."""
+    print(key)
+    print(f"  {desc}")
+    print(f"  current: {'yes' if current else 'no'}")
+    reply = _read_reply("  enable? [y/n, - to unset]> ")
+    if not reply:
+        print("  (unchanged)")
+    elif reply == "-":
+        ctx.git.config_unset(key, global_scope=global_scope)
+        print("  unset.")
+    elif reply.lower() in ("y", "yes"):
+        ctx.git.config_set(key, "true", global_scope=global_scope)
+        print("  set: true")
+    elif reply.lower() in ("n", "no"):
+        ctx.git.config_set(key, "false", global_scope=global_scope)
+        print("  set: false")
+    else:
+        print(f"  (unrecognized: {reply} — unchanged)")
+    print()
+
+
+def _setup_multi_lines(ctx, key, desc, global_scope, current):
+    """Prompt for a multi-valued config whose values contain spaces (e.g. CI
+    check names), so they're entered one per line rather than space-separated.
+    A blank first line keeps the current list; "-" unsets all."""
+    print(key)
+    print(f"  {desc}")
+    print("  current:", f"{len(current)} value(s)" if current else "(none)")
+    for v in current:
+        print(f"    - {v}")
+    print("  new values, one per line; blank line to finish, '-' to unset all:")
+    lines = []
+    while True:
+        reply = _read_reply("    > ")
+        if not reply:
+            break
+        if reply == "-":
+            ctx.git.config_unset(key, global_scope=global_scope, all_values=True)
+            print("  unset.")
+            print()
+            return
+        lines.append(reply)
+    if not lines:
+        print("  (unchanged)")
+        print()
+        return
+    ctx.git.config_unset(key, global_scope=global_scope, all_values=True)
+    for v in lines:
+        ctx.git.config_add(key, v, global_scope=global_scope)
+    print(f"  set: {len(lines)} value(s)")
+    print()
+
+
+def _setup_untracked_cache(ctx, global_scope):
+    """Offer to enable git's untracked cache, which makes `wt list`'s
+    per-worktree `git status` much faster on big trees. It's a property of
+    each worktree's index, so it always goes in the shared repo config (never
+    --global) and takes effect for every worktree; the cache primes on the
+    next `git status`."""
+    print("core.untrackedCache (repo-local)")
+    print("  Speeds up `wt list` by caching the untracked-file scan in each")
+    print("  worktree's index. Untracked files still count as dirty.")
+    if global_scope:
+        print("  (always written to this repo, even though you chose global)")
+    current = ctx.git.config_get("core.untrackedCache") or ""
+    print(f"  current: {current or '(unset)'}")
+    if not ctx.git.test_untracked_cache():
+        print("  (this filesystem doesn't support it; skipping)")
+        print()
+        return
+    reply = _read_reply("  enable? [y/N]> ")
+    if reply in ("y", "Y", "yes", "YES"):
+        ctx.git.config_set("core.untrackedCache", "true")
+        print("  enabled.")
+    else:
+        print("  (unchanged)")
+    print()
+
+
+def cmd_setup(ctx, argv):
+    if argv:
+        die("setup: takes no arguments")
+
+    # Scope prompt: local (default) vs global. Local writes to this repo's
+    # config; global writes to ~/.gitconfig as user-wide defaults.
+    print("wt setup — interactive config")
+    print("Press Enter to keep the current value. Type '-' to unset (revert to default).")
+    print()
+    print("Scope:")
+    print("  [l] this repo (local)      — git config")
+    print("  [g] all repos (global)     — git config --global")
+    reply = _read_reply("scope [l]> ") or "l"
+    if reply in ("l", "local", "L"):
+        global_scope, scope_label = False, "local"
+    elif reply in ("g", "global", "G"):
+        global_scope, scope_label = True, "global"
+    else:
+        die(f"unknown scope: {reply} (expected l or g)")
+    print()
+    print(f"Writing to {scope_label} git config.")
+    print()
+
+    shared = gitcore.SHARED_SECTION
+    _setup_string(ctx, f"{shared}.baseBranch",
+                  "Base branch fetched and branched from (e.g. main, staging)",
+                  ctx.base_branch, global_scope)
+
+    _, resolved_prefix = _prefix_resolution(ctx)
+    _setup_string(ctx, f"{shared}.branchPrefix",
+                  "Prefix added to new branch names (default: local-part of git "
+                  "user.email + /; enter '' for no prefix)",
+                  resolved_prefix or "", global_scope, allow_empty=True)
+
+    _setup_multi(ctx, f"{shared}.protectedWorktrees",
+                 "Extra worktree folder names that refuse delete/rename/"
+                 "foreground (space-separated; .bare and the main worktree are "
+                 "always protected)",
+                 global_scope, ctx.protected)
+
+    _setup_bool(ctx, f"{shared}.nerdFont",
+                "Use Nerd Font glyphs in the PR column (needs a patched font; "
+                "shared with stack)",
+                ctx.git.config_chain_bool("wt.nerdFont", f"{shared}.nerdFont"),
+                global_scope)
+
+    _setup_multi_lines(ctx, f"{shared}.ignoredPendingChecks",
+                       "CI checks whose perpetual 'pending' shouldn't mask the "
+                       "rollup result (shared with stack)",
+                       global_scope,
+                       ctx.git.config_chain_all(
+                           "wt.ignoredPendingChecks",
+                           f"{shared}.ignoredPendingChecks"))
+
+    _setup_untracked_cache(ctx, global_scope)
+
+    # Migration shim (added 2026-06): drop config keys from the pre-`co`
+    # prefix model at the chosen scope. Safe to remove once everyone has
+    # re-run `setup`.
+    legacy_keys = ["wt.claudePrefix", "wt.userPrefix", "wt.defaultPrefix"]
+    removed = False
+    for key in legacy_keys:
+        if ctx.git.config_unset(key, global_scope=global_scope, all_values=True):
+            removed = True
+    if removed:
+        print(f"Removed deprecated config: {', '.join(legacy_keys)}")
+
+    print()
+    print("wt: setup complete. Re-run `wt -h` to see the new resolved config.")
+
+
+# -------- shell integration --------
+
+# The interactive-shell half of wt: a wrapper function so `switch` can cd the
+# *current* shell (a subprocess can't), plus the zsh completion. Emitted by
+# `wt init zsh`; .zshrc runs `eval "$(command wt init zsh)"`.
+ZSH_INIT = r'''wt() {
+  case "$1" in
+    switch|s)
+      local target
+      target="$(command wt path "${@:2}")" || return $?
+      cd "$target"
+      ;;
+    *)
+      command wt "$@"
+      ;;
+  esac
+}
+
+_wt() {
+  local -a subcmds worktrees branches
+  subcmds=(
+    'list:show worktrees + status'
+    'l:show worktrees + status'
+    'checkout:check out a branch in a new worktree (-b creates)'
+    'co:check out a branch in a new worktree (-b creates)'
+    'cob:shorthand for `co -b` (create + check out)'
+    'background:relocate current branch+changes to a new worktree'
+    'bg:relocate current branch+changes to a new worktree'
+    'foreground:pull another worktree'"'"'s branch into cwd'
+    'fg:pull another worktree'"'"'s branch into cwd'
+    'rename:rename branch (optionally folder)'
+    'r:rename branch (optionally folder)'
+    'commit:commit -a in another worktree'
+    'cm:commit -a in another worktree'
+    'open:open a worktree in a new terminal tab'
+    'o:open a worktree in a new terminal tab'
+    'switch:cd to a worktree or checked-out branch'
+    'path:print the path to a worktree (for scripts and other shells)'
+    's:cd to a worktree or checked-out branch'
+    'delete:remove worktree (branch left intact)'
+    'd:remove worktree (branch left intact)'
+    'prune:delete worktrees whose PR/MR is merged or closed'
+    'p:delete worktrees whose PR/MR is merged or closed'
+    'setup:interactively configure wt.* git config'
+    'help:show usage + resolved config'
+  )
+  if (( CURRENT == 2 )); then
+    _describe 'wt subcommand' subcmds
+  else
+    case "${words[2]}" in
+      switch|s)
+        worktrees=("${(@f)$(command wt __complete worktrees)}")
+        branches=("${(@f)$(command wt __complete branches)}")
+        _describe 'worktree' worktrees
+        _describe 'branch' branches
+        ;;
+      checkout|co)
+        # Branches not already in a worktree — the set `co` will accept.
+        branches=("${(@f)$(command wt __complete checkoutable)}")
+        _describe 'branch' branches
+        ;;
+      open|o|delete|d|rename|r|commit|cm|foreground|fg)
+        worktrees=("${(@f)$(command wt __complete worktrees)}")
+        _describe 'worktree' worktrees
+        ;;
+    esac
+  fi
+}
+compdef _wt wt'''
+
+
+def cmd_init(argv):
+    shell = argv[0] if argv else ""
+    if shell != "zsh":
+        die('init: supported shells: zsh (usage: eval "$(wt init zsh)")')
+    print(ZSH_INIT)
+
+
+# -------- dispatch --------
+
+
+def main(argv):
+    # Line-buffer stdout so progress lines interleave correctly with the
+    # output of user-visible git subprocesses even when piped.
+    sys.stdout.reconfigure(line_buffering=True)
+    set_color(sys.stdout.isatty() and not os.environ.get("NO_COLOR"))
+
+    if argv and argv[0] in ("--version", "-V", "version"):
+        print(f"wt {gitcore.VERSION}")
+        return
+
+    # `init` runs at shell startup from any cwd — dispatch it before the
+    # repo-requiring context detection.
+    if argv and argv[0] == "init":
+        cmd_init(argv[1:])
+        return
+
+    ctx = detect_ctx(WtGit())
+    gitcore.apply_display_settings(ctx.git, "wt")
+
+    cmd, rest = (argv[0] if argv else ""), argv[1:]
+    if cmd in ("checkout", "co"):
+        cmd_checkout(ctx, rest)
+    elif cmd == "cob":  # shorthand for `co -b`
+        cmd_checkout(ctx, rest, create=True)
+    elif cmd in ("open", "o"):
+        cmd_open(ctx, rest)
+    elif cmd in ("background", "bg"):
+        cmd_background(ctx, rest)
+    elif cmd in ("list", "l"):
+        cmd_list(ctx, rest)
+    elif cmd in ("delete", "d"):
+        cmd_delete(ctx, rest)
+    elif cmd in ("prune", "p"):
+        cmd_prune(ctx, rest)
+    elif cmd in ("rename", "r"):
+        cmd_rename(ctx, rest)
+    elif cmd in ("commit", "cm"):
+        cmd_commit(ctx, rest)
+    elif cmd in ("switch", "s"):
+        cmd_switch(ctx, rest)
+    elif cmd == "path":
+        cmd_path(ctx, rest)
+    elif cmd == "current":
+        cmd_current(ctx, rest)
+    elif cmd in ("foreground", "fg"):
+        cmd_foreground(ctx, rest)
+    elif cmd == "setup":
+        cmd_setup(ctx, rest)
+    elif cmd == "__complete":
+        cmd_complete(ctx, rest)
+    elif cmd in ("new", "n"):
+        # Deprecated 2026-06: `new` created a branch off the base — that's now
+        # `co -b`. Migration shim; safe to remove once the team has switched.
+        print("wt: 'new' is deprecated; use 'co -b'", file=sys.stderr)
+        cmd_checkout(ctx, rest, create=True)
+    elif cmd in ("-h", "--help", "help"):
+        usage(ctx)
+    elif cmd == "":
+        usage(ctx)
+        sys.exit(1)
+    else:
+        die(f"unknown subcommand: {cmd} (try -h)")
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)

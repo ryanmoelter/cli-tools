@@ -1,0 +1,1715 @@
+#!/usr/bin/env python3
+"""stack — stacked-branch helper for a squash-merge PR/MR workflow.
+
+Manages chains of branches ("stacks") where each branch's PR/MR targets the
+branch below it and the forge squash-merges every one. Works on GitHub (via
+`gh`) or GitLab (via `glab`), auto-detected from the origin URL. Designed to be
+driven mostly by AI agents (explicit args, --json, distinct exit codes) but
+pleasant for humans too (pickers, colored tree output).
+
+- No state in the repo or in git config: a single JSON file lives in
+  <git-common-dir>/stack/, shared by all worktrees of the repo.
+- Local commands (list/create/split/track/navigate/restack) never touch the
+  network. `submit` and `sync` talk to the forge via `gh`/`glab`.
+- Every interactive prompt has a non-interactive equivalent; without a TTY,
+  commands error with the exact invocation to use instead.
+
+Subcommands (see `stack help` for the full text):
+  list|ls [--all] [--json] [--no-pr]     show stack(s) + PR status
+  create|c <name> [--insert]             new branch atop the current one
+  split <name>:<commit> ...              split current branch at boundaries
+  track [<branch>] [--parent <p>]        start tracking (chain auto-discovery)
+  untrack [<branch>]                     stop tracking
+  checkout|co [<branch>]                 switch to a stack branch
+  prev | next | first | last             navigate the stack
+  restack [--all] [--trunk] [-i] [--dry-run]  rebase current branch + ancestors onto their parents
+  submit [--all] [--ready] [--dry-run]   push + create/retarget PRs for current + ancestors
+  sync [--all] [--push] [--dry-run]      fetch + absorb merged PRs + restack current + ancestors
+  setup                                  interactively configure ryanmoelter-cli-tools.*
+  __complete <what>                      hidden: completion candidates
+
+State schema (.git/stack/branches.json):
+  {"version": 2, "branches": {"<branch>": {"parent": "...", "base": "<sha>"}}}
+There is no explicit stack object: a "stack" is a tree derived by following
+parent pointers, rooted at any branch whose parent isn't tracked (the trunk
+is never tracked). `base` is the commit of `parent` this branch was last
+stacked on — the lower bound for `git rebase --onto`, which is what keeps
+restacks correct after a parent is squash-merged or rewritten.
+
+GitHub's native stacked PRs are used additively, never as the source of truth:
+`submit` registers the chain so reviewers get the stack navigator, and `list`
+shows membership. Rebasing still runs off the local `base` above — GitHub's
+headRefOid/base describe the PR, ours records what has already been replayed,
+and adopting theirs would drop that lower bound. Their model is a flat ordered
+list and their local state is per-worktree, so it can represent neither our
+forking trees nor our worktree-shared state; ours stays authoritative.
+
+Exit codes: 0 ok · 1 error · 3 restack stopped on a rebase conflict
+"""
+
+import fcntl
+import json
+import os
+import sys
+import tempfile
+from contextlib import contextmanager
+
+# Shared infrastructure (Git/forge backends, colors, PR glyphs) lives in
+# _common/ next to this script; see gitcore.py's module docstring.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "_common"))
+
+import gitcore
+import ui
+from forge import (  # noqa: F401 (re-exported for tests)
+    Gh, Gl, forge_kind, gitlab_fullpath, rollup_checks, start_fetch,
+)
+from gitcore import Git, die, warn
+from ui import (  # noqa: F401 (glyphs re-exported for tests)
+    SYM_AHEAD, SYM_APPROVED, SYM_CHANGES, SYM_CLOSED, SYM_DOWN, SYM_DRAFT,
+    SYM_OPEN, SYM_UP,
+    branch_pr_chip, pick, pr_chip, pr_net_off_chip, set_color, set_glyphs,
+)
+
+gitcore.set_prog("stack")
+
+EXIT_CONFLICT = 3
+
+SYM_BRANCH = ""  # nf-oct-git_branch
+SYM_RESTACK = "↻"
+SYM_STACK = ""      # membership in a GitHub native stack
+
+# list-graph glyphs
+SYM_NODE = "●"       # a branch or trunk commit node
+SYM_NODE_CUR = "➜"   # the current branch's node
+GT_V = "│"           # vertical spine
+GT_GAP = "┆"         # elided spine: trunk commits skipped between fork points
+GT_H = "─"           # horizontal
+GT_T = "├"           # tee: spine continues + branch leaves rightward
+GT_BR = "╯"          # bottom-right corner: child column drops into parent
+
+# -------- state: a single JSON file in <git-common-dir>/stack/ --------
+
+
+def stack_dir(git):
+    return os.path.join(git.git_common_dir(), "stack")
+
+
+def state_path(git):
+    return os.path.join(stack_dir(git), "branches.json")
+
+
+def load_state(git):
+    """→ (brs, dirty): {branch: {"parent","base"}} plus whether it already
+    needs saving (legacy one-file-per-stack state is merged and deleted
+    branches are pruned in memory here; the next mutating command persists
+    the cleanup)."""
+    brs, dirty = {}, False
+    d = stack_dir(git)
+    files = sorted(os.listdir(d)) if os.path.isdir(d) else []
+    for fn in files:
+        if not fn.endswith(".json"):
+            continue
+        fpath = os.path.join(d, fn)
+        try:
+            with open(fpath) as f:
+                data = json.load(f)
+            if data.get("version", 1) > 2:
+                die(f"{fpath} has state version {data['version']} — this stack binary is too old")
+            loaded = data["branches"]
+        except (json.JSONDecodeError, KeyError, OSError) as e:
+            warn(f"ignoring unreadable state file {fpath}: {e}")
+            continue
+        if fn != "branches.json":  # legacy one-file-per-stack layout
+            dirty = True
+        for b, e in loaded.items():
+            if b in brs:
+                warn(f"branch '{b}' appears in multiple state files — keeping the first entry")
+                continue
+            brs[b] = e
+    existing = set(git.local_branches())
+    for b in list(brs):
+        if b in existing:
+            continue
+        parent = brs[b]["parent"]
+        for e in brs.values():
+            if e["parent"] == b:
+                e["parent"] = parent  # base untouched: still names b's old tip
+        del brs[b]
+        dirty = True
+        warn(f"pruned deleted branch '{b}' from stack state")
+    return brs, dirty
+
+
+def save_state(git, brs, dirty=True):
+    if not dirty:
+        return
+    d = stack_dir(git)
+    os.makedirs(d, exist_ok=True)
+    for fn in os.listdir(d):  # retire legacy per-stack files
+        if fn.endswith(".json") and fn != "branches.json":
+            os.unlink(os.path.join(d, fn))
+    if not brs:
+        try:
+            os.unlink(state_path(git))
+        except FileNotFoundError:
+            pass
+        return
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".branches.")
+    with os.fdopen(fd, "w") as f:
+        json.dump({"version": 2, "branches": brs}, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, state_path(git))
+
+
+@contextmanager
+def state_lock(git):
+    d = stack_dir(git)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "lock"), "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        yield
+
+
+# -------- stack graph (pure functions over the branch map) --------
+# There is no stored stack object: a stack is the tree reachable from a root
+# (a tracked branch whose parent isn't tracked). `subtree(brs, root)` is both
+# a stack's member list and its topological order.
+
+
+def root_of(brs, b):
+    while brs[b]["parent"] in brs:
+        b = brs[b]["parent"]
+    return b
+
+
+def stack_of(brs, b):
+    """The tree containing b, as its own branch map (shares entry dicts)."""
+    return {x: brs[x] for x in subtree(brs, root_of(brs, b))}
+
+
+def children_of(brs, b):
+    return sorted(c for c, e in brs.items() if e["parent"] == b)
+
+
+def roots_of(brs):
+    return sorted(b for b, e in brs.items() if e["parent"] not in brs)
+
+
+def topo_order(brs):
+    order, queue = [], roots_of(brs)
+    while queue:
+        b = queue.pop(0)
+        order.append(b)
+        queue.extend(children_of(brs, b))
+    return order
+
+
+def depth_map(brs):
+    depths = {}
+    for b in topo_order(brs):
+        depths[b] = depths.get(brs[b]["parent"], 0) + 1
+    return depths
+
+
+def subtree(brs, b):
+    out, queue = [], [b]
+    while queue:
+        x = queue.pop(0)
+        out.append(x)
+        queue.extend(children_of(brs, x))
+    return out
+
+
+def path_to(brs, b):
+    """The linear chain from b's root down to b (parents-first). Unlike
+    subtree(root), this excludes siblings and descendants."""
+    chain = []
+    while True:
+        chain.append(b)
+        p = brs[b]["parent"]
+        if p not in brs:
+            break
+        b = p
+    chain.reverse()
+    return chain
+
+
+# -------- predicates --------
+
+
+def parent_tip(git, brs, b):
+    p = brs[b]["parent"]
+    if p in brs:
+        return git.rev(p)
+    if p == git.trunk() or not git.branch_exists(p):
+        return git.trunk_tip()
+    return git.rev(p)
+
+
+def parent_is_trunk(brs, b):
+    """True for a stack root: its parent isn't another tracked branch, so its
+    effective parent is the trunk."""
+    return brs[b]["parent"] not in brs
+
+
+def needs_restack(git, brs, b):
+    """Actionable: a tracked parent branch moved/was rewritten, so b no longer
+    sits on it. Roots (trunk-parented) are never "needs restack" — being behind
+    a fast-moving trunk is reported separately as behind_trunk."""
+    if parent_is_trunk(brs, b):
+        return False
+    return not git.is_ancestor(parent_tip(git, brs, b), git.rev(b))
+
+
+def behind_trunk(git, brs, b):
+    """Informational: a root is behind the trunk tip. Only meaningful for roots;
+    inner branches' relation to trunk is mediated by their parent."""
+    if not parent_is_trunk(brs, b):
+        return False
+    return not git.is_ancestor(git.trunk_tip(), git.rev(b))
+
+
+def cascaded_needs_restack(git, brs):
+    """needs-restack per branch, where a parent that will move implies the
+    child will too (matches what a real restack run would do). "behind trunk"
+    is deliberately NOT part of this — it does not cascade."""
+    nr = {}
+    for b in topo_order(brs):
+        nr[b] = needs_restack(git, brs, b) or nr.get(brs[b]["parent"], False)
+    return nr
+
+
+def commits_over_parent(git, brs, b):
+    """How many commits `b` adds on top of its parent (own-commit count)."""
+    return git.rev_list_count(f"{parent_tip(git, brs, b)}..{b}")
+
+
+def trunk_distance(git, base):
+    """Trunk commits between a merge-base sha and the trunk tip (fork depth)."""
+    return git.rev_list_count(f"{base}..{git.trunk_tip()}")
+
+
+# -------- ui helpers --------
+
+
+def require_current_tracked(git, brs):
+    cur = git.current_branch()
+    if not cur:
+        die("detached HEAD — check out a branch first")
+    if cur not in brs:
+        if cur == git.trunk():
+            die(f"on trunk '{cur}' — `stack co <branch>` or `stack create <name>` to start a stack")
+        die(f"'{cur}' is not in a stack — run `stack track` first (`stack list --all` shows stacks)")
+    return cur
+
+
+# -------- list --------
+
+
+def _graph_prefix(live, col, glyph):
+    """Render the left graph gutter for a row: `│ ` in every currently-open
+    column left of `col`, then `glyph` in `col`. Column c → screen offset 2c;
+    trunk is column 0. Returns (rendered, visible_width_up_to_glyph)."""
+    cells = []
+    for c in range(col):
+        cells.append(f"{GT_V} " if c in live else "  ")
+    cells.append(glyph)
+    return "".join(cells), 2 * col + 1
+
+
+def _note(git, nr, sub, b):
+    if nr.get(b):
+        return f"  {ui.YELLOW}{SYM_RESTACK} needs restack{ui.RESET}"
+    if behind_trunk(git, sub, b):
+        return f"  {ui.DIM}{SYM_RESTACK} behind {git.trunk()}{ui.RESET}"
+    return ""
+
+
+def github_stack_drift(sub, prs):
+    """Branches whose GitHub stack membership contradicts the local chain: a
+    branch in a different stack than its parent, or ordered before it. GitHub's
+    stacks are linear and keep merged members, so a *subset* of the chain being
+    registered is normal — only a genuine disagreement counts.
+
+    → {branch: reason}. Empty when the forge has no stack data at all."""
+    drift = {}
+    for b in sub:
+        st = (prs.get(b) or {}).get("stack")
+        parent = sub[b]["parent"]
+        pst = (prs.get(parent) or {}).get("stack") if parent in sub else None
+        if not st or not pst:
+            continue
+        if st["number"] != pst["number"]:
+            drift[b] = f"in stack #{st['number']}, parent in #{pst['number']}"
+        elif st["position"] <= pst["position"]:
+            drift[b] = f"ordered below its parent in stack #{st['number']}"
+    return drift
+
+
+def render_stacks(git, brs, roots, cur, prs, pr_state, forge_icon=None, num_prefix="#"):
+    """git-log-graph view: the far-left column is the trunk's commit line; each
+    root attaches at its merge-base, ordered by fork recency. See the design
+    notes for the full contract. Returns the rendered text (no trailing
+    newline); callers print it. pr_state: "on" (per-branch chip), "wait" (fetch
+    timed out → dim net-off chip), "error" (fetch failed → red net-off chip), or
+    "off" (column omitted)."""
+    if forge_icon is None:
+        forge_icon = ui.SYM_GITHUB
+    pre = git.branch_prefix()
+    drift = github_stack_drift(brs, prs) if pr_state == "on" else {}
+
+    _ab_cache = {}
+
+    def origin_ab(b):
+        if b not in _ab_cache:
+            _ab_cache[b] = git.origin_ahead_behind(b)
+        return _ab_cache[b]
+
+    def chip_for(b):
+        if pr_state == "off":
+            return None
+        if pr_state == "wait":
+            return pr_net_off_chip(forge_icon, failed=False)
+        if pr_state == "error":
+            return pr_net_off_chip(forge_icon, failed=True)
+        chip = branch_pr_chip(prs.get(b), origin_ab(b) is not None, forge_icon, num_prefix)
+        st = (prs.get(b) or {}).get("stack")
+        if st:
+            rendered, width = chip
+            tag = f"{SYM_STACK}{st['number']}"
+            return f"{rendered} {ui.DIM}{tag}{ui.RESET}", width + 1 + len(tag)
+        return chip
+
+    def ahead_behind_text(b):
+        ab = origin_ab(b)
+        if not ab:
+            return ""
+        a, be = ab
+        parts = []
+        if a:
+            parts.append(f"{SYM_UP}{a}")
+        if be:
+            parts.append(f"{SYM_DOWN}{be}")
+        return f" {ui.GREEN}{' '.join(parts)}{ui.RESET}" if parts else ""
+
+    def name_cell(b):
+        """(rendered, visible_width) for the branch name."""
+        shown = f"{ui.DIM}{pre}{ui.RESET}{b[len(pre):]}" if pre and b.startswith(pre) else b
+        if b == cur:
+            shown = f"{ui.BOLD}{b}{ui.RESET}"
+        return shown, len(b)
+
+    # Row descriptors. Each is a dict with a pre-rendered graph prefix, its
+    # visible width (for name alignment), and optional name/chip/label/note.
+    rows = []
+
+    def count_label(sub, nr, b):
+        n = commits_over_parent(git, sub, b)
+        note = _note(git, nr, sub, b)
+        if not note and b in drift:
+            note = f"  {ui.DIM}{SYM_STACK} {drift[b]}{ui.RESET}"
+        return (f" {ui.DIM}{SYM_AHEAD}{n} {'commit' if n == 1 else 'commits'}{ui.RESET}"
+                + ahead_behind_text(b)
+                + note)
+
+    def emit_subtree(sub, nr, b, col, live):
+        """Append rows for b's block, top to bottom: the spine-continuation
+        child first, then any teed-off siblings (forked to col+1, below the
+        spine child), then b's own node + connector. `live` is the set of
+        columns with an open spine to b's left."""
+        kids = children_of(sub, b)
+        spine_child = kids[-1] if kids else None
+        if spine_child:
+            emit_subtree(sub, nr, spine_child, col, live)
+            # straight connector for the spine child, in its own column
+            g, _ = _graph_prefix(live, col, GT_V)
+            rows.append({"graph": g, "gpw": None,
+                         "label": count_label(sub, nr, spine_child)})
+        for k in kids[:-1]:
+            emit_subtree(sub, nr, k, col + 1, live | {col})
+            # merge row: close col+1 back into col
+            g = [(f"{GT_V} " if c in live else "  ") for c in range(col)]
+            g.append(f"{GT_T}{GT_H}{GT_BR}")
+            rows.append({"graph": "".join(g), "gpw": None,
+                         "label": count_label(sub, nr, k)})
+        # b's own node row
+        glyph = f"{ui.BOLD}{ui.CYAN}{SYM_NODE_CUR}{ui.RESET}" if b == cur else SYM_NODE
+        g, gpw = _graph_prefix(live, col, glyph)
+        name_r, name_w = name_cell(b)
+        rows.append({
+            "graph": g, "gpw": gpw, "branch": b,
+            "name": name_r, "name_w": name_w,
+            "chip": chip_for(b),
+        })
+
+    # Split roots by fork recency: distance-0 roots sit above the trunk HEAD
+    # node; the rest below, nearest first.
+    ranked = sorted(roots, key=lambda r: trunk_distance(git, brs[r]["base"]))
+    above = [r for r in ranked if trunk_distance(git, brs[r]["base"]) == 0]
+    below = [r for r in ranked if trunk_distance(git, brs[r]["base"]) > 0]
+
+    for r in above:
+        sub = stack_of(brs, r)
+        nr = cascaded_needs_restack(git, sub)
+        emit_subtree(sub, nr, r, 1, {0})
+        # root's own-commit count merges into the trunk (col 0)
+        rows.append({"graph": f"{GT_T}{GT_H}{GT_BR}", "gpw": None,
+                     "label": count_label(sub, nr, r)})
+
+    # trunk HEAD node
+    rows.append({
+        "graph": SYM_NODE, "gpw": 1, "branch": None,
+        "name": f"{ui.DIM}{git.trunk()}{ui.RESET}", "name_w": len(git.trunk()),
+        "chip": None,
+    })
+
+    prev_base = git.trunk_tip()  # spine descends from HEAD through each attachment
+    for r in below:
+        base = brs[r]["base"]
+        # trunk commits between the node above on the spine and r's fork point
+        gap = git.rev_list_count(f"{base}..{prev_base}")
+        rows.append({
+            "graph": GT_GAP, "gpw": None,
+            "label": f"{ui.DIM}{gap}{ui.RESET}",
+        })
+        sub = stack_of(brs, r)
+        nr = cascaded_needs_restack(git, sub)
+        emit_subtree(sub, nr, r, 1, {0})
+        rows.append({"graph": f"{GT_T}{GT_H}{GT_BR}", "gpw": None,
+                     "label": count_label(sub, nr, r)})
+        prev_base = base
+
+    # Trunk continues into older history below the last attachment. When no root
+    # forks below HEAD, the HEAD node is already the bottom-most trunk node, so
+    # this terminus would just duplicate it.
+    if below:
+        rows.append({"graph": SYM_NODE, "gpw": None})
+
+    # Alignment: name field width and PR-chip width across node rows only.
+    node_rows = [r for r in rows if r.get("gpw") is not None and "name" in r]
+    name_field = max((r["gpw"] + 1 + r["name_w"] for r in node_rows), default=0)
+    pr_w = max((r["chip"][1] for r in node_rows if r.get("chip")), default=0)
+
+    out = []
+    for r in rows:
+        line = r["graph"]
+        if "name" in r:
+            line += " " + r["name"]
+            used = r["gpw"] + 1 + r["name_w"]
+            line += " " * (name_field - used)
+            if r.get("chip"):
+                rendered, width = r["chip"]
+                line += f"  {rendered}" + " " * (pr_w - width)
+        elif "label" in r:
+            line += r["label"]
+        out.append(line.rstrip())
+    return "\n".join(out)
+
+
+def cmd_list(git, forge, argv):
+    show_all = json_out = no_pr = False
+    for a in argv:
+        if a == "--all":
+            show_all = True
+        elif a == "--json":
+            json_out = True
+        elif a == "--no-pr":
+            no_pr = True
+        else:
+            die(f"unknown argument: {a}")
+    brs, _dirty = load_state(git)
+    cur = git.current_branch()
+    if not brs:
+        die("no stacks tracked yet — `stack create <name>` or `stack track`")
+    if show_all:
+        roots = roots_of(brs)
+    else:
+        root = root_of(brs, cur) if cur and cur in brs else None
+        if root is None and len(roots_of(brs)) == 1:
+            root = roots_of(brs)[0]
+        if root is None:
+            die("current branch is not in a stack — try `stack list --all`")
+        roots = [root]
+    all_branches = [b for r in roots for b in subtree(brs, r)]
+    with_pr = not no_pr and forge is not None and forge.have()
+    if not no_pr and forge is not None and not forge.have():
+        cli = "glab" if isinstance(forge, Gl) else "gh"
+        warn(f"{cli} not installed — {forge.NOUN} info unavailable (--no-pr to silence)")
+    # Fetch on a daemon thread so a slow forge can't hang the listing; the local
+    # graph work below overlaps it.
+    fetch = start_fetch(forge.prs_for_or_none, all_branches) if with_pr else None
+
+    if json_out:
+        # JSON needs the actual PR data, so wait it out rather than time out.
+        prs = {}
+        if fetch is not None:
+            done, box = fetch
+            done.wait(30)
+            prs = box.get("prs") or {}
+        branches = []
+        sub = {b: brs[b] for b in all_branches}
+        depths = depth_map(sub)
+        nr = cascaded_needs_restack(git, sub)
+        for b in all_branches:
+            pr = prs.get(b)
+            branches.append(
+                {
+                    "name": b,
+                    "parent": brs[b]["parent"],
+                    "depth": depths[b],
+                    "current": b == cur,
+                    "needs_restack": nr[b],
+                    "behind_trunk": behind_trunk(git, sub, b),
+                    "pr": {
+                        "number": pr["number"],
+                        "state": pr["state"],
+                        "is_draft": pr["isDraft"],
+                        "base": pr["baseRefName"],
+                        "url": pr["url"],
+                    }
+                    if pr
+                    else None,
+                    "github_stack": pr.get("stack") if pr else None,
+                }
+            )
+        print(json.dumps({"trunk": git.trunk(), "current": cur, "branches": branches}, indent=2))
+        return
+
+    # Collect the fetch with a ~1s budget, mirroring wt: "on" once the map lands,
+    # "error" when the forge was unreachable, "wait" on timeout, "off" with no forge.
+    pr_state, prs = "off", {}
+    if fetch is not None:
+        done, box = fetch
+        if done.wait(1.0):
+            got = box.get("prs")
+            pr_state, prs = ("on", got) if got is not None else ("error", {})
+        else:
+            pr_state = "wait"
+    icon = forge_icon_for(forge)
+    prefix = forge.NUM_PREFIX if forge else "#"
+    print(render_stacks(git, brs, roots, cur, prs, pr_state, forge_icon=icon, num_prefix=prefix))
+
+
+# -------- create / split / track / untrack --------
+
+
+def cmd_create(git, forge, argv):
+    insert, name = False, None
+    for a in argv:
+        if a == "--insert":
+            insert = True
+        elif a.startswith("-"):
+            die(f"unknown flag: {a}")
+        elif name is None:
+            name = a
+        else:
+            die("too many arguments (usage: stack create <name> [--insert])")
+    if not name:
+        die("usage: stack create <name> [--insert]")
+    name = git.apply_prefix(name)
+    if git.branch_exists(name):
+        die(f"branch '{name}' already exists — `stack track {name}` to track it")
+    cur = git.current_branch()
+    if not cur:
+        die("detached HEAD — check out a branch first")
+    with state_lock(git):
+        brs, _dirty = load_state(git)
+        if cur not in brs and cur != git.trunk():
+            die(f"'{cur}' is not in a stack — run `stack track` first")
+        if insert and cur not in brs:
+            die("--insert requires the current branch to be in a stack")
+        p = git.run(["git", "switch", "-c", name], capture=False, check=False)
+        if p.returncode != 0:
+            sys.exit(p.returncode)
+        brs[name] = {"parent": cur, "base": git.rev(name)}
+        if insert:
+            for c, e in brs.items():
+                if c != name and e["parent"] == cur:
+                    e["parent"] = name  # base already == this tip, so consistent
+        save_state(git, brs)
+    print(f"created '{name}' on '{cur}'" + (" (children moved onto it)" if insert else ""))
+
+
+def cmd_split(git, forge, argv):
+    cur = git.current_branch()
+    if not cur:
+        die("detached HEAD — check out a branch first")
+    with state_lock(git):
+        brs, _dirty = load_state(git)
+        entry = brs.get(cur)
+        if entry is None:
+            die(f"'{cur}' is not in a stack — run `stack track` first")
+        tip = git.rev(cur)
+        base = entry["base"]
+        if not git.is_ancestor(base, tip):
+            base = git.merge_base(parent_tip(git, brs, cur), tip)
+        commits = git.git("rev-list", "--reverse", f"{base}..{cur}").splitlines()
+        if len(commits) < 2:
+            die(f"'{cur}' has {len(commits)} commit(s) on '{entry['parent']}' — nothing to split")
+        pairs = argv and parse_split_args(git, argv, commits) or None
+        if pairs is None:
+            pairs = interactive_split(git, cur, commits)
+        pairs = [(git.apply_prefix(n), sha) for n, sha in pairs]
+        for n, _sha in pairs:
+            if git.branch_exists(n):
+                die(f"branch '{n}' already exists")
+        if len({n for n, _ in pairs}) != len(pairs):
+            die("duplicate branch names")
+        prev_name, prev_sha = entry["parent"], entry["base"]
+        for n, sha in pairs:
+            git.git("branch", n, sha)
+            brs[n] = {"parent": prev_name, "base": prev_sha}
+            prev_name, prev_sha = n, sha
+        entry["parent"], entry["base"] = prev_name, prev_sha
+        save_state(git, brs)
+        print(f"split '{cur}' into: {', '.join(n for n, _ in pairs)} ← {cur}")
+        print(render_stacks(git, brs, [root_of(brs, cur)], cur, {}, pr_state="off"))
+
+
+def parse_split_args(git, argv, commits):
+    pairs, last_idx = [], -1
+    for a in argv:
+        name, sep, committish = a.partition(":")
+        if not sep or not name or not committish:
+            die(f"expected <name>:<commit>, got '{a}'")
+        sha = git.rev(committish)
+        if sha not in commits:
+            die(f"{committish} ({sha[:12]}) is not one of this branch's own commits")
+        idx = commits.index(sha)
+        if idx <= last_idx:
+            die("boundaries must be in ascending (oldest-first) order and distinct")
+        if idx == len(commits) - 1:
+            die(f"{committish} is the branch tip — the current branch keeps the last commits")
+        pairs.append((name, sha))
+        last_idx = idx
+    return pairs
+
+
+def interactive_split(git, cur, commits):
+    subjects = {
+        line.split(" ", 1)[0]: line.split(" ", 1)[1]
+        for line in git.git("log", "--reverse", "--format=%H %s", f"{commits[0]}~..{cur}").splitlines()
+    }
+    listing = "\n".join(
+        f"  {i:2}) {sha[:10]} {subjects.get(sha, '')}" for i, sha in enumerate(commits, 1)
+    )
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        die(
+            "no TTY — pass boundaries as arguments: stack split <name>:<commit> ...\n"
+            f"commits on '{cur}' (oldest first):\n{listing}"
+        )
+    print(f"commits on '{cur}' (oldest first):\n{listing}")
+    try:
+        raw = input("boundary commit numbers, space-separated oldest first "
+                    f"(1-{len(commits) - 1}; '{cur}' keeps the rest): ").split()
+        indices = []
+        for r in raw:
+            if not r.isdigit() or not 1 <= int(r) <= len(commits) - 1:
+                die(f"invalid boundary: {r!r}")
+            indices.append(int(r) - 1)
+        if not indices or sorted(set(indices)) != indices:
+            die("boundaries must be distinct and ascending")
+        pairs = []
+        for i in indices:
+            name = input(f"branch name ending at {commits[i][:10]} ({subjects.get(commits[i], '')}): ").strip()
+            if not name:
+                die("empty branch name")
+            pairs.append((name, commits[i]))
+        return pairs
+    except EOFError:
+        die("cancelled")
+
+
+def track_with_parent(git, brs, branch, parent, announce=True):
+    if parent == branch:
+        die("a branch cannot be its own parent")
+    if parent != git.trunk() and not git.branch_exists(parent):
+        die(f"no local branch '{parent}'")
+    if parent != git.trunk() and parent not in brs:
+        die(f"parent '{parent}' is not tracked — `stack track {parent}` first")
+    ptip = git.rev(parent) if parent in brs else git.trunk_tip()
+    base = git.merge_base(ptip, git.rev(branch))
+    if base is None:
+        die(f"'{branch}' shares no history with '{parent}'")
+    if branch not in brs:
+        brs[branch] = {"parent": parent, "base": base}
+    else:
+        if parent in subtree(brs, branch):
+            die(f"'{parent}' is stacked on top of '{branch}' — that would be a cycle")
+        brs[branch].update(parent=parent, base=base)
+    if announce:
+        print(f"tracking '{branch}' (parent: {parent})")
+
+
+def track_chain(git, brs, branch):
+    btip = git.rev(branch)
+    tbase = git.merge_base(git.trunk_tip(), btip)
+    if tbase is None:
+        die(f"'{branch}' shares no history with trunk '{git.trunk()}'")
+    cands = []
+    for l in git.local_branches():
+        if l in (branch, git.trunk()):
+            continue
+        ltip = git.rev(l)
+        if ltip != btip and git.is_ancestor(ltip, btip) and not git.is_ancestor(ltip, tbase):
+            cands.append((l, ltip))
+    cands.sort(key=lambda t: git.rev_list_count(f"{tbase}..{t[1]}"))
+    for (_na, ta), (_nb, tb) in zip(cands, cands[1:]):
+        if ta == tb or not git.is_ancestor(ta, tb):
+            die(
+                f"branches between trunk and '{branch}' don't form a single chain "
+                f"({', '.join(n for n, _ in cands)}) — use `stack track --parent <p>` explicitly"
+            )
+    prev_name, prev_tip = git.trunk(), git.trunk_tip()
+    newly = []
+    for n, t in cands + [(branch, btip)]:
+        if n in brs:  # already tracked — leave alone
+            prev_name, prev_tip = n, t
+            continue
+        brs[n] = {"parent": prev_name, "base": git.merge_base(prev_tip, t)}
+        newly.append(f"{n} (parent: {prev_name})")
+        prev_name, prev_tip = n, t
+    print("tracking: " + ", ".join(newly))
+
+
+def cmd_track(git, forge, argv):
+    parent, branch = None, None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--parent":
+            i += 1
+            if i >= len(argv):
+                die("--parent needs a value")
+            parent = argv[i]
+        elif a.startswith("-"):
+            die(f"unknown flag: {a}")
+        elif branch is None:
+            branch = a
+        else:
+            die("too many arguments (usage: stack track [<branch>] [--parent <p>])")
+        i += 1
+    if branch is None:
+        branch = git.current_branch()
+        if not branch:
+            die("detached HEAD — pass a branch name")
+    if not git.branch_exists(branch):
+        die(f"no local branch '{branch}'")
+    if branch == git.trunk():
+        die(f"'{branch}' is the trunk — it can't be part of a stack")
+    with state_lock(git):
+        brs, dirty = load_state(git)
+        if parent is not None:
+            track_with_parent(git, brs, branch, parent)
+        else:
+            entry = brs.get(branch)
+            if entry is not None:
+                print(f"'{branch}' is already tracked (parent: {entry['parent']}) — use --parent to move it")
+                save_state(git, brs, dirty)
+                return
+            track_chain(git, brs, branch)
+        save_state(git, brs)
+
+
+def cmd_untrack(git, forge, argv):
+    if len(argv) > 1:
+        die("too many arguments (usage: stack untrack [<branch>])")
+    branch = argv[0] if argv else git.current_branch()
+    if not branch:
+        die("detached HEAD — pass a branch name")
+    with state_lock(git):
+        brs, dirty = load_state(git)
+        entry = brs.get(branch)
+        if entry is None:
+            print(f"'{branch}' is not tracked — nothing to do")
+            save_state(git, brs, dirty)
+            return
+        parent = entry["parent"]
+        for e in brs.values():
+            if e["parent"] == branch:
+                e["parent"] = parent  # base untouched: still names branch's old tip
+        del brs[branch]
+        save_state(git, brs)
+    print(f"untracked '{branch}' (git branch left intact)")
+
+
+# -------- navigation --------
+
+
+def cmd_checkout(git, forge, argv):
+    if len(argv) > 1:
+        die("too many arguments (usage: stack checkout [<branch>])")
+    if argv:
+        if not git.branch_exists(argv[0]):
+            die(f"no local branch '{argv[0]}'")
+        git.switch_to(argv[0])
+        return
+    brs, _dirty = load_state(git)
+    if not brs:
+        die("no stacks tracked yet")
+    cur = git.current_branch()
+    depths = depth_map(brs)
+    cands = []
+    for root in roots_of(brs):
+        for b in subtree(brs, root):
+            mark = "  ← current" if b == cur else ""
+            cands.append((b, f"{'  ' * (depths[b] - 1)}{b}{mark}"))
+    git.switch_to(pick(cands, "branch"))
+
+
+def nav_context(git):
+    """→ (cur, brs, entry) with brs scoped to one stack's tree. From an
+    untracked branch (e.g. trunk), fall back to the only stack when there's
+    exactly one."""
+    brs, _dirty = load_state(git)
+    cur = git.current_branch()
+    if not cur:
+        die("detached HEAD — check out a branch first")
+    entry = brs.get(cur)
+    if entry is None:
+        if not brs:
+            die("no stacks tracked yet")
+        roots = roots_of(brs)
+        if len(roots) != 1:
+            die(f"'{cur}' is not in a stack and there are several — `stack co <branch>` (roots: {', '.join(roots)})")
+        return cur, stack_of(brs, roots[0]), entry
+    return cur, stack_of(brs, cur), entry
+
+
+def cmd_nav(which, git, forge, argv):
+    if argv:
+        die(f"stack {which} takes no arguments")
+    cur, brs, entry = nav_context(git)
+    if which == "prev":
+        if entry is None:
+            die(f"'{cur}' is not in a stack")
+        p = entry["parent"]
+        if p in brs or git.branch_exists(p):
+            git.switch_to(p)
+            return
+        die(f"parent '{p}' has no local branch")
+    elif which == "next":
+        cands = roots_of(brs) if entry is None else children_of(brs, cur)
+        if not cands:
+            die(f"'{cur}' has no child — it's the tip")
+        if len(cands) > 1:
+            die(f"multiple children: {', '.join(cands)} — use `stack co <branch>`")
+        git.switch_to(cands[0])
+    elif which == "first":
+        roots = roots_of(brs)
+        if len(roots) > 1:
+            die(f"multiple roots: {', '.join(roots)} — use `stack co <branch>`")
+        git.switch_to(roots[0])
+    elif which == "last":
+        leaves = [b for b in topo_order(brs) if not children_of(brs, b)]
+        if len(leaves) > 1:
+            die(f"multiple tips: {', '.join(leaves)} — use `stack co <branch>`")
+        git.switch_to(leaves[0])
+
+
+# -------- restack --------
+
+
+def rebase_in_progress(git):
+    return any(
+        os.path.exists(git.git("rev-parse", "--git-path", d))
+        for d in ("rebase-merge", "rebase-apply")
+    )
+
+
+def restack_preflight(git):
+    if not git.current_branch():
+        die("detached HEAD — check out a branch first")
+    if rebase_in_progress(git):
+        die("a rebase is in progress — `git rebase --continue` or `git rebase --abort` first")
+    if git.git("status", "--porcelain", "--untracked-files=no"):
+        die("working tree not clean — commit or stash first")
+
+
+def restack_stack(git, brs, members, dry, include_trunk=False):
+    """Rebase each branch in `members` (a pre-ordered, parents-first list) onto
+    its parent. Saves state incrementally; exits EXIT_CONFLICT on a
+    conflict. → [(branch, action)]
+
+    Trunk moves (rebasing a root onto the latest trunk) happen only when
+    include_trunk is set, OR when the root's stored base is no longer on trunk
+    (a squash-merged/rewritten base that can't be replayed onto). Otherwise a
+    root behind a fast-moving trunk is left where it sits — that's not a restack."""
+    wmap = git.worktree_map()
+    cur_wt = git.git("rev-parse", "--show-toplevel")
+    moved = set()
+    results = []
+    for b in members:
+        pname = brs[b]["parent"]
+        ptip = parent_tip(git, brs, b)
+        # A root sitting cleanly on trunk isn't moved onto the latest trunk
+        # unless asked (--trunk) or forced (base fell off trunk).
+        note = ""
+        if parent_is_trunk(brs, b):
+            must_move = not git.is_ancestor(brs[b]["base"], git.trunk_tip())
+            if not (include_trunk or must_move):
+                # Leave the root where it sits relative to trunk. Don't heal base
+                # to trunk_tip() here — that would falsely claim it's up to date.
+                results.append((b, "already stacked"))
+                continue
+            if must_move and not include_trunk:
+                note = f" (base no longer on {git.trunk()})"
+        if git.is_ancestor(ptip, git.rev(b)) and not (dry and pname in moved):
+            if brs[b]["base"] != ptip:
+                brs[b]["base"] = ptip  # heal bookkeeping (e.g. after a manual
+                if not dry:            # rebase with rebase.updateRefs=true)
+                    save_state(git, brs)
+            results.append((b, "already stacked"))
+            continue
+        if dry:
+            results.append((b, f"would rebase onto {pname}{note}"))
+            moved.add(b)
+            continue
+        wt = wmap.get(b)
+        if wt and wt != cur_wt:
+            die(f"'{b}' is checked out in another worktree ({wt}) — restack there or detach it")
+        oldbase = brs[b]["base"]
+        if not git.is_ancestor(oldbase, git.rev(b)):
+            oldbase = git.merge_base(ptip, git.rev(b))
+            warn(f"stored base for '{b}' is stale — using merge-base {oldbase[:12]}")
+        p = git.run(
+            ["git", "-c", "rebase.updateRefs=false", "rebase", "--onto", ptip, oldbase, b],
+            capture=False,
+            check=False,
+        )
+        if p.returncode != 0:
+            warn(
+                f"rebase of '{b}' onto '{pname}' stopped on conflicts.\n"
+                "  resolve them, then `git rebase --continue` (or `git rebase --abort`),\n"
+                "  then re-run `stack restack` — it resumes where it stopped."
+            )
+            sys.exit(EXIT_CONFLICT)
+        brs[b]["base"] = ptip
+        save_state(git, brs)
+        results.append((b, f"rebased onto {pname}{note}"))
+        moved.add(b)
+    return results
+
+
+def interactive_restack(git, brs, cur):
+    """Run `git rebase -i` on `cur`'s own commits (those atop its parent tip),
+    letting the user drop/reorder/edit/squash. Rewriting the branch this way is
+    what makes `stack restack -i` a superset of `git rebase -i` — it also heals
+    the stored base afterward so descendants restack cleanly onto the new tip.
+
+    An `edit`/`break` stop leaves git 0 but the rebase still open, while a
+    conflict leaves it nonzero and open — so we key off whether a rebase is in
+    progress afterward, not the return code. Either way we exit EXIT_CONFLICT
+    without healing the base: the user finishes with `git rebase --continue`,
+    then a plain `stack restack` heals the base (it sees cur already sits on
+    its parent) and flags descendants."""
+    ptip = parent_tip(git, brs, cur)
+    if git.rev_list_count(f"{ptip}..{cur}") == 0:
+        die(f"'{cur}' has no commits on '{brs[cur]['parent']}' — nothing to rebase")
+    # rebase.updateRefs on would let git drag descendant refs along mid-rebase;
+    # we manage those ourselves via stored bases, so force it off.
+    git.run(
+        ["git", "-c", "rebase.updateRefs=false", "rebase", "-i", ptip],
+        capture=False,
+        check=False,
+    )
+    if rebase_in_progress(git):
+        warn(
+            f"interactive rebase of '{cur}' is still in progress (a conflict, or an "
+            "edit/break stop).\n"
+            "  finish it with `git rebase --continue` (or `git rebase --abort`), then\n"
+            "  `stack restack` to heal the base and flag branches above it."
+        )
+        sys.exit(EXIT_CONFLICT)
+    brs[cur]["base"] = ptip  # cur now sits directly on its parent tip
+    save_state(git, brs)
+    print(f"  {cur}: interactively rebased onto {brs[cur]['parent']}")
+
+
+def warn_descendants_need_restack(git, brs, cur):
+    """When a scoped restack/submit skipped branches stacked above `cur`, name
+    any that need (or will need) their own restack. Uses the cascading
+    predicate so a descendant is flagged when `cur` itself is about to move,
+    which is what `--dry-run` should preview too."""
+    nr = cascaded_needs_restack(git, brs)
+    stale = [b for b in subtree(brs, cur) if b != cur and nr[b]]
+    if stale:
+        warn(f"branches above '{cur}' may need their own restack: "
+             f"{', '.join(stale)} (run from there or use --all)")
+
+
+def cmd_restack(git, forge, argv):
+    dry = "--dry-run" in argv
+    include_trunk = "--trunk" in argv
+    all_ = "--all" in argv
+    interactive = "-i" in argv or "--interactive" in argv
+    leftover = [a for a in argv
+                if a not in ("--dry-run", "--trunk", "--all", "-i", "--interactive")]
+    if leftover:
+        die(f"unknown argument: {leftover[0]}")
+    if interactive and (all_ or include_trunk or dry):
+        die("-i rebases only the current branch — incompatible with --all/--trunk/--dry-run")
+    if not dry:
+        restack_preflight(git)
+    with state_lock(git):
+        brs, dirty = load_state(git)
+        cur = require_current_tracked(git, brs)
+        if interactive:
+            interactive_restack(git, brs, cur)  # saves state itself on success
+            warn_descendants_need_restack(git, brs, cur)
+            return
+        members = subtree(brs, root_of(brs, cur)) if all_ else path_to(brs, cur)
+        results = restack_stack(git, brs, members, dry, include_trunk)
+        if not dry:
+            save_state(git, brs, dirty)
+    if not dry and git.current_branch() != cur:
+        git.switch_to(cur, quiet=True)
+    for b, action in results:
+        print(f"  {b}: {action}")
+    if not all_:
+        warn_descendants_need_restack(git, brs, cur)
+
+
+# -------- submit --------
+
+
+def push_branch(git, b, dry):
+    """→ True on success."""
+    if dry:
+        print(f"  would push {b}")
+        return True
+    p = git.run(["git", "push", "--force-with-lease", "origin", b], check=False)
+    if p.returncode != 0:
+        warn(f"push failed for '{b}': {(p.stderr or '').strip()}")
+        return False
+    print(f"  pushed {b}")
+    return True
+
+
+def retarget_pr(forge, b, pr, parent, dry):
+    ref = f"{forge.NOUN} {forge.NUM_PREFIX}{pr['number']}"
+    if pr["baseRefName"] == parent:
+        return
+    if dry:
+        print(f"  would retarget {ref} ({b}) base → {parent}")
+        return
+    p = forge.pr_edit(pr["number"], parent)
+    if p.returncode != 0:
+        warn(f"failed to retarget {ref}: {(p.stderr or '').strip()}")
+    else:
+        print(f"  retargeted {ref} ({b}) base → {parent}")
+
+
+def plan_stack_update(existing, desired):
+    """Decide how to reconcile a GitHub stack with the local chain.
+    existing/desired are PR-number lists, bottom→top; existing is [] when no
+    stack exists yet. → (action, payload):
+
+      ("noop", None)      already correct, or too small to be a stack
+      ("create", [...])   register the whole chain
+      ("add", [...])      append these PRs to the top
+      ("drift", reason)   the shapes genuinely disagree — never auto-destructive
+
+    Merged members stay in a GitHub stack, so a chain whose lower PRs have
+    landed still reads as a prefix and resolves to add/noop, not drift."""
+    if not existing:
+        return ("create", list(desired)) if len(desired) >= 2 else ("noop", None)
+    if desired == existing:
+        return ("noop", None)
+    if len(desired) > len(existing) and desired[:len(existing)] == existing:
+        return ("add", desired[len(existing):])
+    return ("drift", f"GitHub has {existing}, local chain is {desired}")
+
+
+def sync_github_stack(git, forge, order, prs, dry):
+    """Register/extend the native GitHub stack for a just-submitted linear
+    chain. Best-effort: warns and returns on any failure, never raising or
+    affecting the exit code — the PRs themselves are already correct."""
+    numbers = [prs[b]["number"] for b in order if prs.get(b)]
+    if len(numbers) < 2:
+        return
+    # Look the stack up from the bottom PR: it's the one already registered
+    # when the chain has grown a new tip. `pull_requests` comes back bottom→top,
+    # matching our order.
+    existing_stack = forge.stack_for_pr(numbers[0])
+    existing = [p["number"] for p in (existing_stack or {}).get("pull_requests") or []]
+    if existing_stack and not existing:
+        warn(f"GitHub stack #{existing_stack.get('number')} returned no members "
+             "— leaving it alone")
+        return
+    action, payload = plan_stack_update(existing, numbers)
+    if action == "noop":
+        return
+    if action == "drift":
+        warn(f"GitHub stack #{existing_stack['number']} doesn't match this chain "
+             f"({payload}) — leaving it alone; adjust it in the PR UI")
+        return
+    if dry:
+        if action == "create":
+            print(f"  would register GitHub stack for {len(payload)} PRs")
+        else:
+            print(f"  would add {len(payload)} PR(s) to GitHub stack "
+                  f"#{existing_stack['number']}")
+        return
+    if action == "create":
+        ok, data = forge.stack_create(payload)
+        label = f"#{data['number']}" if isinstance(data, dict) and data.get("number") else ""
+        msg = f"registered GitHub stack {label}".rstrip()
+    else:
+        ok, _ = forge.stack_add(existing_stack["number"], payload)
+        msg = f"added {len(payload)} PR(s) to GitHub stack #{existing_stack['number']}"
+    if ok:
+        print(f"  {msg}")
+    else:
+        warn("could not update the GitHub stack (PRs are unaffected)")
+        forge.mark_stacks_unavailable(git)
+
+
+def cmd_submit(git, forge, argv):
+    ready = "--ready" in argv
+    dry = "--dry-run" in argv
+    all_ = "--all" in argv
+    leftover = [a for a in argv if a not in ("--ready", "--dry-run", "--all")]
+    if leftover:
+        die(f"unknown argument: {leftover[0]}")
+    require_forge(forge)
+    noun = forge.NOUN
+    num = forge.NUM_PREFIX
+    all_brs, _dirty = load_state(git)
+    cur = require_current_tracked(git, all_brs)
+    order = subtree(all_brs, root_of(all_brs, cur)) if all_ else path_to(all_brs, cur)
+    brs = {x: all_brs[x] for x in order}
+    if any(cascaded_needs_restack(git, brs).values()):
+        warn("stack needs a restack — consider `stack restack` first (submitting anyway)")
+    failed = [b for b in order if not push_branch(git, b, dry)]
+    prs = forge.prs_for(order)
+    for b in order:
+        parent = brs[b]["parent"]
+        pr = prs.get(b)
+        if pr and pr["state"] == "OPEN":
+            retarget_pr(forge, b, pr, parent, dry)
+        elif pr and pr["state"] == "MERGED":
+            warn(f"'{b}' {noun} {num}{pr['number']} is already merged — run `stack sync`")
+        else:  # no PR/MR, or an old closed one — create fresh
+            subjects = git.git("log", "--reverse", "--format=%s", f"{parent_tip(git, brs, b)}..{b}").splitlines()
+            if not subjects:
+                warn(f"'{b}' has no commits on '{parent}' — skipping {noun} creation")
+                continue
+            kind = noun if ready else f"draft {noun}"
+            if dry:
+                print(f"  would create {kind} for {b} (base {parent}): {subjects[0]}")
+                continue
+            p = forge.pr_create(head=b, base=parent, title=subjects[0], body="", draft=not ready)
+            if p.returncode != 0:
+                warn(f"failed to create {noun} for '{b}': {(p.stderr or '').strip()}")
+                failed.append(b)
+            else:
+                print(f"  created {kind} for {b}: {p.stdout.strip()}")
+    if isinstance(forge, Gh) and forge.stacks_enabled(git):
+        # GitHub's stacks are strictly linear; ours are trees. `path_to` is a
+        # chain by construction, but --all can hand us a forking subtree.
+        if any(len(children_of(brs, b)) > 1 for b in order):
+            print("  note: local stack forks — leaving the GitHub stack alone "
+                  "(submit from a single branch to register its chain)")
+        else:
+            # Re-read: PRs created above aren't in the map fetched before the loop.
+            sync_github_stack(git, forge, order, forge.prs_for(order), dry)
+    if not all_:
+        warn_descendants_need_restack(git, all_brs, cur)
+    if failed:
+        sys.exit(1)
+
+
+# -------- sync --------
+
+
+def cmd_sync(git, forge, argv):
+    push = "--push" in argv
+    dry = "--dry-run" in argv
+    all_ = "--all" in argv
+    leftover = [a for a in argv if a not in ("--push", "--dry-run", "--all")]
+    if leftover:
+        die(f"unknown argument: {leftover[0]}")
+    require_forge(forge)
+    noun = forge.NOUN
+    num = forge.NUM_PREFIX
+    if not dry:
+        restack_preflight(git)
+    original = git.current_branch()
+    p = git.run(["git", "fetch", "--prune", "origin"], capture=False, check=False)
+    if p.returncode != 0:
+        die("fetch failed")
+    # Opportunistically advance the local trunk (fails harmlessly if checked out).
+    git.run(["git", "fetch", "origin", f"{git.trunk()}:{git.trunk()}"], check=False)
+    had_errors = False
+    with state_lock(git):
+        brs, dirty = load_state(git)
+
+        # Track local branches that have open PRs/MRs (fresh-clone recovery).
+        untracked_prs = forge.prs_for(b for b in git.local_branches() if b != git.trunk() and b not in brs)
+        changed = True
+        while changed:
+            changed = False
+            for b, pr in untracked_prs.items():
+                if b in brs or not pr or pr["state"] != "OPEN":
+                    continue
+                baseref = pr["baseRefName"]
+                if baseref == git.trunk() or baseref in brs:
+                    print(("would track" if dry else "tracking") + f" '{b}' ({noun} {num}{pr['number']}, base {baseref})")
+                    track_with_parent(git, brs, b, baseref, announce=False)
+                    dirty = True
+                    changed = True
+
+        # Absorb squash-merged PRs/MRs.
+        tracked_prs = forge.prs_for(sorted(brs))
+        skipped = set()  # members of stacks that need manual reconciliation
+        for root in roots_of(brs):
+            for b in subtree(brs, root):
+                pr = tracked_prs.get(b)
+                if not pr or pr["state"] != "MERGED":
+                    continue
+                if git.rev(b) != pr["headRefOid"]:
+                    warn(f"'{b}' has local commits beyond merged {noun} {num}{pr['number']} — "
+                         "reconcile manually; skipping its stack")
+                    skipped.update(subtree(brs, root_of(brs, b)))
+                    had_errors = True
+                    break
+                parent = brs[b]["parent"]
+                print(("would remove" if dry else "removing")
+                      + f" '{b}' ({noun} {num}{pr['number']} merged) — children move onto '{parent}'")
+                for e in brs.values():
+                    if e["parent"] == b:
+                        e["parent"] = parent  # base untouched: still names b's old
+                        #  tip, so the next restack replays only the child's commits
+                if not dry:
+                    if git.current_branch() == b:
+                        target = parent if (parent in brs or git.branch_exists(parent)) else git.trunk()
+                        git.switch_to(target, quiet=True)
+                    dp = git.run(["git", "branch", "-D", b], check=False)
+                    if dp.returncode != 0:
+                        wt = git.worktree_map().get(b)
+                        warn(f"could not delete '{b}'"
+                             + (f" — checked out in {wt}" if wt else f": {(dp.stderr or '').strip()}"))
+                del brs[b]
+                dirty = True
+
+        # Scope the mutating phases (restack, push, retarget). Tracking and
+        # absorption above stay global — they only add tracking or delete
+        # already-merged branches, neither of which can clobber a child that's
+        # checked out in another worktree. Rebasing and force-pushing can, so by
+        # default confine those to the current branch's chain (its ancestors down
+        # to trunk); --all restores whole-tree behavior. The anchor is where the
+        # checkout landed after absorption (an absorbed `original` left us on its
+        # parent), falling back to trunk when the current branch isn't tracked.
+        if all_:
+            scoped = [b for root in roots_of(brs) for b in subtree(brs, root)]
+        else:
+            anchor = git.current_branch()
+            scoped = path_to(brs, anchor) if anchor in brs else []
+            if not scoped:
+                warn("current branch is not in a stack — nothing scoped to restack "
+                     "(use --all to sync every stack)")
+
+        def in_scope(b):
+            return b in scoped and b not in skipped
+
+        # Restack the scoped chain(s), parents-first, then optionally push.
+        for root in roots_of(brs):
+            if skipped & set(subtree(brs, root)):
+                continue
+            members = [b for b in subtree(brs, root) if b in scoped]
+            for b, action in restack_stack(git, brs, members, dry, include_trunk=True):
+                print(f"  {b}: {action}")
+        if not dry:
+            save_state(git, brs, dirty)
+        if push:
+            pushable = [b for root in roots_of(brs) for b in subtree(brs, root) if in_scope(b)]
+            # Re-read PR state: the maps above predate absorption, and on a
+            # GitHub stack the server retargets a child onto the stack's base
+            # the moment its parent merges. Retargeting off the stale map would
+            # aim a base back at the branch we just deleted.
+            fresh_prs = forge.prs_for(pushable) if pushable else {}
+            for b in pushable:
+                if not push_branch(git, b, dry):
+                    had_errors = True
+                    continue
+                pr = fresh_prs.get(b)
+                if pr and pr["state"] == "OPEN":
+                    retarget_pr(forge, b, pr, brs[b]["parent"], dry)
+    if not dry and original and git.branch_exists(original) and git.current_branch() != original:
+        git.switch_to(original, quiet=True)
+    if had_errors:
+        sys.exit(1)
+
+
+# -------- setup --------
+
+
+def cmd_setup(git, forge, argv):
+    if argv:
+        die("setup takes no arguments")
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        die(
+            "setup is interactive — without a TTY, set config directly:\n"
+            f"  git config [--global] {gitcore.SHARED_SECTION}.branchPrefix <prefix>"
+            "   (e.g. 'me/'; default: none)\n"
+            f"  git config [--global] {gitcore.SHARED_SECTION}.nerdFont true"
+            "   (Nerd Font glyphs; default: plain)"
+        )
+    print("stack setup — interactive config")
+    print("Press Enter to keep the current value. Type '-' to unset (revert to default).")
+    print()
+    print("Scope:")
+    print("  [l] this repo (local)      — git config")
+    print("  [g] all repos (global)     — git config --global")
+    shared = gitcore.SHARED_SECTION
+    try:
+        reply = input("scope [l]> ").strip() or "l"
+        scope = {"l": False, "local": False, "g": True, "global": True}.get(reply.lower())
+        if scope is None:
+            die(f"unknown scope: {reply} (expected l or g)")
+        print()
+        current = git.branch_prefix()
+        print(f"{shared}.branchPrefix — prepended to branch names by `create` and")
+        print("`split`, and shared with wt. Include any separator yourself (e.g.")
+        print("'me/'). Default: none.")
+        raw = input(f"{shared}.branchPrefix [{current or '(none)'}]> ").strip()
+        print()
+        print(f"{shared}.nerdFont — use Nerd Font glyphs in the PR column (needs a")
+        print("patched font). Shared with wt. Default: no (plain Unicode).")
+        nerd_now = git.config_chain_bool("stack.nerdFont", f"{shared}.nerdFont")
+        nerd = input(f"  enable? [y/n, - to unset] [{'yes' if nerd_now else 'no'}]> ").strip()
+    except EOFError:
+        die("cancelled")
+
+    prefix_key = f"{shared}.branchPrefix"
+    if raw == "":
+        print("branchPrefix kept as-is.")
+    elif raw == "-":
+        git.config_unset(prefix_key, global_scope=scope)
+        print(f"{prefix_key} unset (no prefix).")
+    else:
+        if raw in ("''", '""'):
+            raw = ""
+        git.config_set(prefix_key, raw, global_scope=scope)
+        print(f"{prefix_key} = {raw!r}")
+
+    nerd_key = f"{shared}.nerdFont"
+    if nerd == "":
+        print("nerdFont kept as-is.")
+    elif nerd == "-":
+        git.config_unset(nerd_key, global_scope=scope)
+        print(f"{nerd_key} unset (plain glyphs).")
+    elif nerd.lower() in ("y", "yes"):
+        git.config_set(nerd_key, "true", global_scope=scope)
+        print(f"{nerd_key} = true")
+    elif nerd.lower() in ("n", "no"):
+        git.config_set(nerd_key, "false", global_scope=scope)
+        print(f"{nerd_key} = false")
+    else:
+        print(f"nerdFont unrecognized ({nerd}) — unchanged.")
+
+    print()
+    print("stack: setup complete. `stack -h` shows the resolved config.")
+
+
+# -------- completion + help --------
+
+COMMANDS = [
+    "list", "l", "la", "create", "c", "split", "track", "untrack",
+    "checkout", "co", "prev", "next", "first", "last",
+    "restack", "submit", "sync", "setup", "help",
+]
+
+
+def cmd_complete(git, forge, argv):
+    gitcore.set_quiet(True)
+    what = argv[0] if argv else ""
+    if what == "commands":
+        print("\n".join(COMMANDS))
+    elif what == "stack-branches":
+        brs, _dirty = load_state(git)
+        for b in sorted(brs):
+            print(b)
+    elif what == "all-branches":
+        for b in git.local_branches():
+            print(b)
+
+
+def usage(forge=None, git=None):
+    print(
+        f"""{ui.BOLD}stack{ui.RESET} — stacked-branch helper for a squash-merge PR/MR workflow
+
+usage: {ui.BOLD}stack <command> [args]{ui.RESET}
+
+Inspect
+  {ui.BOLD}list|l [--all] [--json] [--no-pr]{ui.RESET}
+        Show the current stack (--all: every stack). PR/MR info comes from
+        gh/glab when installed and authenticated; --no-pr skips the network.
+  {ui.BOLD}la{ui.RESET}    Shorthand for `list --all`.
+
+Build
+  {ui.BOLD}create|c <name> [--insert]{ui.RESET}
+        Create <name> on top of the current branch and switch to it
+        (uncommitted changes ride along). The current branch must be the
+        trunk or tracked. ryanmoelter-cli-tools.branchPrefix is prepended to <name>
+        (default: none — see `stack setup`). --insert: existing children
+        of the current branch are reparented onto <name>.
+  {ui.BOLD}split <name>:<commit> [<name>:<commit> ...]{ui.RESET}
+        Split the current branch at commit boundaries, oldest first: each
+        <name> is created ending at <commit> (inclusive); the current branch
+        keeps the commits above the last boundary. Never rewrites history —
+        branches are planted at existing commits. New names get
+        ryanmoelter-cli-tools.branchPrefix. With no args on a TTY, pick boundaries
+        interactively.
+  {ui.BOLD}track [<branch>] [--parent <p>]{ui.RESET}
+        Start tracking <branch> (default: current). Without --parent, any
+        untracked local branches whose tips sit between the trunk and
+        <branch> are tracked too, in ancestry order. --parent skips
+        discovery; on an already-tracked branch it moves the branch (and
+        its descendants) under <p>.
+  {ui.BOLD}untrack [<branch>]{ui.RESET}
+        Stop tracking (the git branch is untouched; children are reparented
+        onto its parent).
+
+Navigate (plain `git switch` — never creates or rewrites anything)
+  {ui.BOLD}checkout|co [<branch>]{ui.RESET}    Switch to a stack branch (picker without an arg).
+  {ui.BOLD}prev{ui.RESET}                      Parent branch (trunk when at the root).
+  {ui.BOLD}next{ui.RESET}                      Child branch (errors listing children if >1).
+  {ui.BOLD}first{ui.RESET}                     Root of the stack (closest to trunk).
+  {ui.BOLD}last{ui.RESET}                      Tip of the stack (errors if >1 leaf).
+
+Maintain
+  {ui.BOLD}restack [--all] [--trunk] [-i] [--dry-run]{ui.RESET}
+        Rebase the current branch and its ancestors (down to trunk) onto
+        their parents, parents first. Branches stacked above the current one
+        are left untouched — run restack from there when you're ready (they're
+        named in a note if they need it). --all does the whole stack tree
+        instead. By default the stack root is left where it sits relative to
+        trunk (being behind a fast-moving trunk isn't a restack). --trunk
+        also rebases the root onto the latest trunk. A root whose base has
+        fallen off trunk (squash-merged/rewritten) is moved onto trunk
+        regardless. -i (interactive) runs `git rebase -i` on just the current
+        branch's own commits — the git rebase todo editor, to drop/reorder/
+        squash/edit them — then heals the stored base so branches above it
+        restack cleanly onto the new tip (they're named in a note; -i can't be
+        combined with --all/--trunk/--dry-run). Local only — no fetch, no forge.
+        On a conflict: exits 3; resolve, `git rebase --continue`, then re-run
+        `stack restack` (it resumes where it stopped; `git rebase --abort`
+        backs out of the current step only).
+  {ui.BOLD}submit [--all] [--ready] [--dry-run]{ui.RESET}
+        Push the current branch and its ancestors (force-with-lease), create
+        PRs/MRs for branches that lack one (base = parent; DRAFT unless
+        --ready), and retarget existing open ones whose base is wrong.
+        Branches stacked above the current one are left untouched; --all
+        submits the whole stack tree. On GitHub repos with native stacked PRs
+        enabled, the chain is also registered as a GitHub stack (giving
+        reviewers the stack navigator in the PR UI) and extended as it grows;
+        a forking stack or one whose order disagrees with GitHub's is left
+        alone with a note. Best-effort — the PRs are unaffected if it fails.
+  {ui.BOLD}sync [--all] [--push] [--dry-run]{ui.RESET}
+        Fetch; start tracking local branches that have open PRs/MRs; absorb
+        squash-merged ones (delete the local branch, reparent children onto
+        its parent). Then restack — by default only the current branch and its
+        ancestors (down to trunk), leaving branches above it untouched since
+        they're usually checked out in other worktrees and can't be moved from
+        here; --all restacks every stack. Tracking and absorption always scan
+        every stack (they only add tracking or drop already-merged branches).
+        With --push, also force-push and retarget bases for the same scoped
+        branches (never creates PRs/MRs — that's `submit`).
+
+  {ui.BOLD}setup{ui.RESET}                     Interactively configure ryanmoelter-cli-tools.* git config.
+  {ui.BOLD}help{ui.RESET}                      Show this text.
+
+Exit codes: 0 ok · 1 error · 3 restack stopped on a rebase conflict
+
+State: .git/stack/branches.json (shared by all worktrees); stacks are trees
+derived from per-branch parent pointers.
+Trunk: a configured baseBranch, else origin/HEAD, else main. PRs/MRs: GitHub
+via gh or GitLab via glab (auto-detected from origin; override with
+ryanmoelter-cli-tools.forge). Local commands work without a forge. Self-hosted host?
+Set ryanmoelter-cli-tools.forge to github or gitlab.
+
+Settings live in git config under ryanmoelter-cli-tools.*, shared with wt, so each one
+needs setting only once. A repo-local value overrides a global one, so
+`--global` gives user-wide defaults:
+  git config ryanmoelter-cli-tools.baseBranch staging   {ui.DIM}# default: origin/HEAD → "main"{ui.RESET}
+  git config ryanmoelter-cli-tools.branchPrefix me/     {ui.DIM}# prefix for create/split names{ui.RESET}
+  git config ryanmoelter-cli-tools.branchPrefix ""      {ui.DIM}# no prefix — branches use bare names{ui.RESET}
+  git config ryanmoelter-cli-tools.forge gitlab         {ui.DIM}# github|gitlab|none; default: from origin URL{ui.RESET}
+  git config ryanmoelter-cli-tools.nerdFont true        {ui.DIM}# Nerd Font glyphs; default: plain Unicode{ui.RESET}
+  git config --add ryanmoelter-cli-tools.ignoredPendingChecks "ci/slow job"
+                                              {ui.DIM}# repeatable; CI checks whose perpetual{ui.RESET}
+                                              {ui.DIM}# "pending" shouldn't mask the result{ui.RESET}
+
+`stack setup` sets these interactively. Matching stack.* keys are still read
+and win when set, for backwards compatibility only. One stack-only key:
+stack.githubStacksEnabled caches "does this repo have native stacked PRs" —
+delete it to re-probe."""
+    )
+
+    print()
+    print("\n".join(ui.glyph_key(
+        forge_icon=forge_icon_for(forge) if forge is not None else "",
+        num_prefix=forge.NUM_PREFIX if forge is not None else "#",
+        extra=[
+            (SYM_NODE_CUR, ui.BOLD + ui.CYAN, "the current branch"),
+            (SYM_NODE, "", "a branch or trunk commit"),
+            (GT_GAP, "", "trunk commits elided between fork points"),
+            (SYM_RESTACK, ui.YELLOW, "needs restack, or behind trunk"),
+            (SYM_STACK, ui.DIM, "member of a GitHub native stack"),
+        ],
+    )))
+
+    # Resolved values, mirroring `wt -h`. Skipped outside a repo, where there's
+    # no config to resolve against.
+    if git is None:
+        return
+    shared = gitcore.SHARED_SECTION
+    nerd = git.config_chain_bool("stack.nerdFont", f"{shared}.nerdFont")
+    ignored = git.config_chain_all(
+        "stack.ignoredPendingChecks", f"{shared}.ignoredPendingChecks")
+    prefix = git.branch_prefix()
+    print(f"""
+Current config (resolved), set via `stack setup` or `git config {shared}.*`:
+  baseBranch           {git.trunk()}
+  branchPrefix         {prefix or "(none — no prefix)"}
+  forge                {forge_kind(git.origin_url(), git.config_chain("stack.forge", f"{shared}.forge"))}
+  nerdFont             {"yes" if nerd else "no"}
+  ignoredPendingChecks {f"{len(ignored)} check(s)" if ignored else "(none)"}""")
+
+
+# -------- forge selection --------
+
+
+def select_forge(git):
+    """The forge backend for this repo (Gh/Gl), or None when origin is neither
+    GitHub nor GitLab. A configured forge overrides the URL sniff for self-hosted
+    hosts. Local commands ignore a None forge; submit/sync require one."""
+    kind = forge_kind(
+        git.origin_url(),
+        git.config_chain("stack.forge", f"{gitcore.SHARED_SECTION}.forge"),
+    )
+    if kind == "github":
+        return Gh()
+    if kind == "gitlab":
+        fullpath = gitlab_fullpath(git.origin_url())
+        return Gl(fullpath) if fullpath else None
+    return None
+
+
+def forge_icon_for(forge):
+    return ui.SYM_GITLAB if isinstance(forge, Gl) else ui.SYM_GITHUB
+
+
+def require_forge(forge):
+    if forge is None:
+        die("no GitHub or GitLab remote detected — set "
+            f"`git config {gitcore.SHARED_SECTION}.forge <github|gitlab>` for a self-hosted host")
+    forge.require()
+
+
+# Completion only: unlike wt, no stack subcommand changes the shell's
+# directory, so there is no wrapper function to install.
+STACK_ZSH_INIT = r"""_stack() {
+  local -a subcmds branches
+  subcmds=(
+    'list:show the stack + PR status'
+    'ls:show the stack + PR status'
+    'create:new branch on top of the current one'
+    'c:new branch on top of the current one'
+    'split:split the current branch at commit boundaries'
+    'track:start tracking a branch (auto-discovers the chain)'
+    'untrack:stop tracking a branch'
+    'checkout:switch to a stack branch'
+    'co:switch to a stack branch'
+    'prev:switch to the parent branch'
+    'next:switch to the child branch'
+    'first:switch to the stack root'
+    'last:switch to the stack tip'
+    'restack:rebase each branch onto its parent'
+    'submit:push + create/retarget draft PRs'
+    'sync:fetch, absorb merged PRs, restack'
+    'setup:interactively configure ryanmoelter-cli-tools.* git config'
+    'help:show usage'
+  )
+  if (( CURRENT == 2 )); then
+    _describe 'stack subcommand' subcmds
+  else
+    case "${words[2]}" in
+      checkout|co|untrack)
+        branches=("${(@f)$(command stack __complete stack-branches 2>/dev/null)}")
+        _describe 'branch' branches
+        ;;
+      track)
+        branches=("${(@f)$(command stack __complete all-branches 2>/dev/null)}")
+        _describe 'branch' branches
+        ;;
+    esac
+  fi
+}
+compdef _stack stack"""
+
+
+def cmd_init(argv):
+    shell = argv[0] if argv else ""
+    if shell != "zsh":
+        die('init: supported shells: zsh (usage: eval "$(stack init zsh)")')
+    print(STACK_ZSH_INIT)
+
+
+def main(argv):
+    set_color(sys.stdout.isatty() and not os.environ.get("NO_COLOR"))
+    if argv and argv[0] in ("--version", "-V", "version"):
+        print(f"stack {gitcore.VERSION}")
+        return
+
+    # `init` runs at shell startup from any cwd, so it precedes anything that
+    # needs a repo.
+    if argv and argv[0] == "init":
+        cmd_init(argv[1:])
+        return
+    if not argv or argv[0] in ("help", "-h", "--help"):
+        # The symbol key reflects the configured glyph set and forge, so the
+        # help path needs both resolved even though it runs no command.
+        git = Git() if Git().git_ok("rev-parse", "--git-dir") else None
+        if git is not None:
+            gitcore.apply_display_settings(git, "stack")
+        usage(select_forge(git) if git is not None else None, git)
+        return
+    cmd, rest = argv[0], argv[1:]
+    dispatch = {
+        "list": cmd_list, "l": cmd_list,
+        "la": lambda g, h, a: cmd_list(g, h, ["--all", *a]),
+        "create": cmd_create, "c": cmd_create,
+        "split": cmd_split,
+        "track": cmd_track,
+        "untrack": cmd_untrack,
+        "checkout": cmd_checkout, "co": cmd_checkout,
+        "prev": lambda g, h, a: cmd_nav("prev", g, h, a),
+        "next": lambda g, h, a: cmd_nav("next", g, h, a),
+        "first": lambda g, h, a: cmd_nav("first", g, h, a),
+        "last": lambda g, h, a: cmd_nav("last", g, h, a),
+        "restack": cmd_restack,
+        "submit": cmd_submit,
+        "sync": cmd_sync,
+        "setup": cmd_setup,
+        "__complete": cmd_complete,
+    }
+    fn = dispatch.get(cmd)
+    if fn is None:
+        die(f"unknown command: {cmd} (see `stack help`)")
+    git = Git()
+    if not git.git_ok("rev-parse", "--git-dir"):
+        die("not inside a git repo")
+    gitcore.apply_display_settings(git, "stack")
+    forge = select_forge(git)
+    fn(git, forge, rest)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
