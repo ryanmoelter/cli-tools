@@ -36,9 +36,19 @@ than shipping.
 
 ```sh
 cd ~/dotfiles/cli-tools
-python3 -m unittest discover tests            # must be green before tagging
+python3 -m unittest discover tests 2>&1 | grep -E '^(Ran |OK|FAILED)'
 git commit -am "Release v$V"
 git tag -a "v$V" -m "v$V" && git push && git push --tags
+```
+
+**Use that `grep`, or check `$?` — do not eyeball a `tail`.** The tools under test
+write to stdout *and* stderr, so the last lines of output are CLI chatter from the final
+test, not the result. `… 2>&1 | tail` and `… 2>&1 >/dev/null | tail` both look identical
+whether the suite passed or failed. The `grep` prints `OK` or `FAILED (failures=N)`; the
+exit code is the other reliable signal:
+
+```sh
+python3 -m unittest discover tests >/dev/null 2>&1; echo "exit=$?"
 ```
 
 The tag must exist before step 4: `brew audit --online` and the formulas' `url` both fetch
@@ -84,6 +94,21 @@ ahead of `~/.scripts` on PATH, so an installed copy silently shadows the dotfile
 and local edits appear to do nothing.
 
 `--formula` is needed for `stack`, which collides with a Homebrew cask of the same name.
+
+`brew test` is quiet on success and its output is all `==>` command echoes, so read its
+**exit code** rather than its last lines — and don't pipe it, since `PIPESTATUS` comes
+back empty here:
+
+```sh
+brew test ryanmoelter/tap/wt    >/tmp/wt-test.log    2>&1; echo "wt exit=$?"
+brew test ryanmoelter/tap/stack >/tmp/stack-test.log 2>&1; echo "stack exit=$?"
+```
+
+Run `brew style` **before pushing** when a formula changed. It only reads Homebrew's own
+tap clone, so the loop is edit → push → `brew update` → `brew style`, and a style fix
+means going round again. Two rules it enforces that are easy to trip: `include` goes
+above `desc`, and use `formula_opt_bin("python@3.14")` rather than
+`Formula["python@3.14"].opt_bin`.
 
 ### 7. Record the new SHAs in dotfiles
 
