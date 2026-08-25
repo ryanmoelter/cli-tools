@@ -63,7 +63,7 @@ def run_(args, check=True, capture=True, input_=None, cwd=None):
 # tool key > shared key > default, so a per-tool value set years ago keeps
 # working while new settings need writing only once.
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 SHARED_SECTION = "ryanmoelter-cli-tools"
 
