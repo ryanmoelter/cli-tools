@@ -25,7 +25,7 @@ Subcommands (see `stack help` for the full text):
   restack [--all] [--trunk] [-i] [--dry-run]  rebase current branch + ancestors onto their parents
   submit [--all] [--ready] [--dry-run]   push + create/retarget PRs for current + ancestors
   sync [--all] [--push] [--dry-run]      fetch + absorb merged PRs + restack current + ancestors
-  setup                                  interactively configure ryanmoelter-cli-tools.*
+  setup                                  interactively configure options
   __complete <what>                      hidden: completion candidates
 
 State schema (.git/stack/branches.json):
@@ -1630,7 +1630,7 @@ STACK_ZSH_INIT = r"""_stack() {
     'restack:rebase each branch onto its parent'
     'submit:push + create/retarget draft PRs'
     'sync:fetch, absorb merged PRs, restack'
-    'setup:interactively configure ryanmoelter-cli-tools.* git config'
+    'setup:interactively configure options'
     'help:show usage'
   )
   if (( CURRENT == 2 )); then

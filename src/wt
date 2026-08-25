@@ -31,14 +31,15 @@ Subcommands:
   list|l        [--json] [--paths]     show worktrees + change/PR markers
   delete|d      <name> [-f|--force]    remove worktree (branch left intact)
   prune|p       [-y|--yes]             delete worktrees whose PR/MR is merged or closed
-  rename|r      [name] <new> [-f|--folder]  rename branch (optionally folder too)
+  rename|r      [name] <new> [-f|--folder]
+                                       rename branch (optionally folder too)
   commit|cm     <name> [git-args]      commit -a in another worktree
   switch|s      <name|branch>          cd there (needs the shell wrapper)
   path          <name|branch>          print the path; for scripts
   current       [--json]               report the cwd's worktree + branch
   foreground|fg <name>                 pull another worktree's branch into cwd
-  setup                                 interactively configure wt.* git config
-  help|-h|--help                        show usage + resolved config
+  setup                                interactively configure options
+  help|-h|--help                       show usage + resolved config
   __complete worktrees|branches        hidden: emit completion candidates
 
 Worktrees are discovered from git's own registry (`git worktree list`), so any
@@ -1918,7 +1919,7 @@ _wt() {
     'd:remove worktree (branch left intact)'
     'prune:delete worktrees whose PR/MR is merged or closed'
     'p:delete worktrees whose PR/MR is merged or closed'
-    'setup:interactively configure wt.* git config'
+    'setup:interactively configure options'
     'help:show usage + resolved config'
   )
   if (( CURRENT == 2 )); then
