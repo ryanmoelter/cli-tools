@@ -12,7 +12,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fakes import FakeWtCtx  # noqa: E402
+from fakes import FakeDone, FakeWtCtx  # noqa: E402
 from load_script import load_script  # noqa: E402
 
 wt = load_script("wt", "wt_mod")
@@ -284,27 +284,6 @@ class RedrawPrefixTest(unittest.TestCase):
     def test_moves_up_by_line_count_and_clears(self):
         self.assertEqual(wt.redraw_prefix(3), "\033[3A\033[J")
 
-
-class ResolvePrStateTest(unittest.TestCase):
-    def test_populated_box_is_on(self):
-        prs = {"main": OPEN_PR}
-        self.assertEqual(wt._resolve_pr_state({"prs": prs}), ("on", prs))
-
-    def test_failed_fetch_is_error(self):
-        self.assertEqual(wt._resolve_pr_state({"prs": None}), ("error", {}))
-
-
-class FakeDone:
-    """A threading.Event stand-in whose wait() returns scripted results, so the
-    two-frame print can be driven without real threads or sleeps."""
-
-    def __init__(self, *results):
-        self.results = list(results)
-        self.waits = []
-
-    def wait(self, timeout=None):
-        self.waits.append(timeout)
-        return self.results.pop(0)
 
 
 class PrintListLiveTest(unittest.TestCase):

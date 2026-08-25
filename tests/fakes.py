@@ -216,3 +216,16 @@ class FakeWtCtx:
         if self._current is None:
             return None, None
         return self._current, self.worktree_path(self._current)
+
+
+class FakeDone:
+    """A threading.Event stand-in whose wait() returns scripted results, so the
+    two-frame print can be driven without real threads or sleeps."""
+
+    def __init__(self, *results):
+        self.results = list(results)
+        self.waits = []
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        return self.results.pop(0)

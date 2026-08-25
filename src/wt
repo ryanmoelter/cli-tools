@@ -87,10 +87,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "_c
 import forge
 import gitcore
 import ui
-from forge import fetch_github_prs, fetch_gitlab_prs, start_fetch
+from forge import (
+    fetch_github_prs, fetch_gitlab_prs, resolve_pr_state, start_fetch,
+)
 from gitcore import die, run_
-from ui import (  # noqa: F401 (set_color re-exported for tests)
-    branch_pr_chip, pr_chip, pr_loading_chip, pr_net_off_chip, set_color,
+from ui import (  # noqa: F401 (set_color/redraw_prefix re-exported for tests)
+    branch_pr_chip, pr_chip, pr_loading_chip, pr_net_off_chip, redraw_prefix,
+    set_color,
 )
 
 gitcore.set_prog("wt")
@@ -1082,12 +1085,6 @@ def render_list(rows, cwd_name, pr_state, pr_by_branch, num_prefix, forge_icon=N
     return "\n".join(lines)
 
 
-def redraw_prefix(n_lines):
-    """ANSI to rewind over an n_lines-tall block already printed: cursor up,
-    then clear from there to the end of the screen."""
-    return f"\033[{n_lines}A\033[J"
-
-
 def build_list_json(rows, cwd_name, pr_state, pr_by_branch, paths, trunk_branches=()):
     """The `wt list --json` payload: {"pr_state", "worktrees": [...]}.
 
@@ -1135,12 +1132,6 @@ _JSON_PR_WAIT = 3.0
 _LIST_PR_TOTAL = 8.0
 
 
-def _resolve_pr_state(box):
-    """A finished fetch's result box → (pr_state, pr_by_branch)."""
-    prs = box.get("prs")
-    return ("on", prs) if prs is not None else ("error", {})
-
-
 def print_list_live(rows, cwd_name, fetch, trunk_branches, live, dirs=None):
     """Print the list table, filling in the PR column as the fetch lands.
 
@@ -1159,7 +1150,7 @@ def print_list_live(rows, cwd_name, fetch, trunk_branches, live, dirs=None):
                            forge_icon, trunk_branches, dirs)
 
     def collect(timeout):
-        return _resolve_pr_state(box) if done.wait(timeout) else ("wait", {})
+        return resolve_pr_state(box) if done.wait(timeout) else ("wait", {})
 
     if not live:
         print(table(*collect(_LIST_PR_TOTAL)))
@@ -1200,7 +1191,7 @@ def cmd_list(ctx, argv):
         pr_state, pr_by_branch = "off", {}
         if fetch is not None:
             done, box, _, _ = fetch
-            pr_state, pr_by_branch = (_resolve_pr_state(box)
+            pr_state, pr_by_branch = (resolve_pr_state(box)
                                       if done.wait(_JSON_PR_WAIT) else ("wait", {}))
         print(json.dumps(build_list_json(rows, cwd_name, pr_state, pr_by_branch,
                                          ctx.worktree_paths_in_list_order(),

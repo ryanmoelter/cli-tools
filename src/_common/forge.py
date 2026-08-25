@@ -43,6 +43,13 @@ def start_fetch(fetch, branches):
     return done, box
 
 
+def resolve_pr_state(box):
+    """A finished fetch's result box → (pr_state, prs). "on" with the map once
+    it lands, "error" with an empty map when the fetch failed."""
+    prs = box.get("prs")
+    return ("on", prs) if prs is not None else ("error", {})
+
+
 def rollup_checks(pr):
     """Fold a PR's statusCheckRollup array into SUCCESS/FAILURE/PENDING/NONE.
     The rollup is a flat list of check contexts (StatusContext exposes

@@ -61,13 +61,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "_c
 import gitcore
 import ui
 from forge import (  # noqa: F401 (re-exported for tests)
-    Gh, Gl, forge_kind, gitlab_fullpath, rollup_checks, start_fetch,
+    Gh, Gl, forge_kind, gitlab_fullpath, resolve_pr_state, rollup_checks,
+    start_fetch,
 )
 from gitcore import Git, die, warn
 from ui import (  # noqa: F401 (glyphs re-exported for tests)
     SYM_AHEAD, SYM_APPROVED, SYM_CHANGES, SYM_CLOSED, SYM_DOWN, SYM_DRAFT,
     SYM_OPEN, SYM_UP,
-    branch_pr_chip, pick, pr_chip, pr_net_off_chip, set_color, set_glyphs,
+    branch_pr_chip, pick, pr_chip, pr_loading_chip, pr_net_off_chip,
+    redraw_prefix, set_color, set_glyphs,
 )
 
 gitcore.set_prog("stack")
@@ -378,19 +380,24 @@ def github_stack_drift(sub, prs):
     return drift
 
 
-def render_stacks(git, brs, roots, cur, prs, pr_state, forge_icon=None, num_prefix="#"):
+def render_stacks(git, brs, roots, cur, prs, pr_state, forge_icon=None, num_prefix="#",
+                  ab_cache=None):
     """git-log-graph view: the far-left column is the trunk's commit line; each
     root attaches at its merge-base, ordered by fork recency. See the design
     notes for the full contract. Returns the rendered text (no trailing
-    newline); callers print it. pr_state: "on" (per-branch chip), "wait" (fetch
-    timed out → dim net-off chip), "error" (fetch failed → red net-off chip), or
-    "off" (column omitted)."""
+    newline); callers print it. pr_state: "on" (per-branch chip), "loading"
+    (fetch still in flight → dim ellipsis chip), "wait" (fetch timed out → dim
+    net-off chip), "error" (fetch failed → red net-off chip), or "off" (column
+    omitted).
+
+    ab_cache lets a caller that renders twice (print_stacks_live) reuse the
+    origin ahead/behind lookups across both frames."""
     if forge_icon is None:
         forge_icon = ui.SYM_GITHUB
     pre = git.branch_prefix()
     drift = github_stack_drift(brs, prs) if pr_state == "on" else {}
 
-    _ab_cache = {}
+    _ab_cache = {} if ab_cache is None else ab_cache
 
     def origin_ab(b):
         if b not in _ab_cache:
@@ -400,6 +407,8 @@ def render_stacks(git, brs, roots, cur, prs, pr_state, forge_icon=None, num_pref
     def chip_for(b):
         if pr_state == "off":
             return None
+        if pr_state == "loading":
+            return pr_loading_chip(forge_icon)
         if pr_state == "wait":
             return pr_net_off_chip(forge_icon, failed=False)
         if pr_state == "error":
@@ -538,6 +547,61 @@ def render_stacks(git, brs, roots, cur, prs, pr_state, forge_icon=None, num_pref
     return "\n".join(out)
 
 
+# A mutating command has already committed to talking to the forge, so it waits
+# rather than degrading to a partial answer the way the listing does.
+_BLOCKING_PR_TOTAL = 30.0
+
+
+def collect_prs(fetch, branches):
+    """Block for an overlapped fetch's result. Falls back to the all-None map
+    forge.prs_for would have returned, so a timeout or failure reads as "no
+    PR/MR here" rather than crashing a half-done submit."""
+    done, box = fetch
+    prs = box.get("prs") if done.wait(_BLOCKING_PR_TOTAL) else None
+    return prs if prs is not None else {b: None for b in branches}
+
+
+# The graph paints immediately and never waits on the forge, so the fetch gets a
+# budget well past what a blocking wait could afford.
+_LIST_PR_TOTAL = 8.0
+
+
+def print_stacks_live(git, brs, roots, cur, fetch, icon, prefix, live):
+    """Print the stack graph, filling in the PR column as the fetch lands.
+
+    On a TTY the graph paints immediately with dim loading chips, redrawn in
+    place once the fetch resolves (or the budget runs out). Off a TTY there is
+    nothing to redraw into, so block for the whole budget and print once — a
+    piped consumer never has to skip a stale frame."""
+    # Shared across both frames: origin_ahead_behind is local-only, so its
+    # answers can't change between them.
+    ab_cache = {}
+
+    def graph(pr_state, prs):
+        return render_stacks(git, brs, roots, cur, prs, pr_state,
+                             forge_icon=icon, num_prefix=prefix,
+                             ab_cache=ab_cache)
+
+    if fetch is None:
+        print(graph("off", {}))
+        return
+
+    done, box = fetch
+
+    def collect(timeout):
+        return resolve_pr_state(box) if done.wait(timeout) else ("wait", {})
+
+    if not live:
+        print(graph(*collect(_LIST_PR_TOTAL)))
+        return
+
+    provisional = graph("loading", {})
+    print(provisional)
+    resolved = graph(*collect(_LIST_PR_TOTAL))
+    sys.stdout.write(redraw_prefix(provisional.count("\n") + 1))
+    print(resolved)
+
+
 def cmd_list(git, forge, argv):
     show_all = json_out = no_pr = False
     for a in argv:
@@ -607,19 +671,11 @@ def cmd_list(git, forge, argv):
         print(json.dumps({"trunk": git.trunk(), "current": cur, "branches": branches}, indent=2))
         return
 
-    # Collect the fetch with a ~1s budget, mirroring wt: "on" once the map lands,
-    # "error" when the forge was unreachable, "wait" on timeout, "off" with no forge.
-    pr_state, prs = "off", {}
-    if fetch is not None:
-        done, box = fetch
-        if done.wait(1.0):
-            got = box.get("prs")
-            pr_state, prs = ("on", got) if got is not None else ("error", {})
-        else:
-            pr_state = "wait"
     icon = forge_icon_for(forge)
     prefix = forge.NUM_PREFIX if forge else "#"
-    print(render_stacks(git, brs, roots, cur, prs, pr_state, forge_icon=icon, num_prefix=prefix))
+    # Gated on isatty() alone: NO_COLOR turns off color, not cursor addressing.
+    print_stacks_live(git, brs, roots, cur, fetch, icon, prefix,
+                      sys.stdout.isatty())
 
 
 # -------- create / split / track / untrack --------
@@ -1214,8 +1270,11 @@ def cmd_submit(git, forge, argv):
     brs = {x: all_brs[x] for x in order}
     if any(cascaded_needs_restack(git, brs).values()):
         warn("stack needs a restack — consider `stack restack` first (submitting anyway)")
+    # Start the PR/MR query before pushing so it overlaps the pushes; a push
+    # never changes which PRs exist, only their heads.
+    fetch = start_fetch(forge.prs_for_or_none, order)
     failed = [b for b in order if not push_branch(git, b, dry)]
-    prs = forge.prs_for(order)
+    prs = collect_prs(fetch, order)
     for b in order:
         parent = brs[b]["parent"]
         pr = prs.get(b)
@@ -1269,6 +1328,14 @@ def cmd_sync(git, forge, argv):
     if not dry:
         restack_preflight(git)
     original = git.current_branch()
+    # Start the untracked-branch query up front so it overlaps the git fetches
+    # below. State is read once here just to scope the query; the authoritative
+    # load happens under the lock, and anything tracked meanwhile is filtered
+    # out there.
+    known = load_state(git)[0]
+    candidates = [b for b in git.local_branches()
+                  if b != git.trunk() and b not in known]
+    untracked_fetch = start_fetch(forge.prs_for_or_none, candidates)
     p = git.run(["git", "fetch", "--prune", "origin"], capture=False, check=False)
     if p.returncode != 0:
         die("fetch failed")
@@ -1279,7 +1346,8 @@ def cmd_sync(git, forge, argv):
         brs, dirty = load_state(git)
 
         # Track local branches that have open PRs/MRs (fresh-clone recovery).
-        untracked_prs = forge.prs_for(b for b in git.local_branches() if b != git.trunk() and b not in brs)
+        untracked_prs = {b: pr for b, pr in collect_prs(untracked_fetch, candidates).items()
+                         if b not in brs}
         changed = True
         while changed:
             changed = False

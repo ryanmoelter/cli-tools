@@ -107,6 +107,12 @@ def set_glyphs(nerd_font):
     globals().update(_NERD_GLYPHS if nerd_font else _PLAIN_GLYPHS)
 
 
+def redraw_prefix(n_lines):
+    """ANSI to rewind over an n_lines-tall block already printed: cursor up,
+    then clear from there to the end of the screen."""
+    return f"\033[{n_lines}A\033[J"
+
+
 def glyph_key(*, forge_icon=None, num_prefix="#", extra=()):
     """The symbol legend for a help page, as lines. Reads the live glyph
     globals, so it always shows whichever set set_glyphs() installed.

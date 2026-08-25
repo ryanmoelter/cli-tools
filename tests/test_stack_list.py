@@ -8,13 +8,15 @@ fakes, so a change that shifts a column or swaps a symbol is caught without a
 real repo.
 """
 
+import contextlib
+import io
 import os
 import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from fakes import FakeGit, FakeGh, FakeGl  # noqa: E402
+from fakes import FakeDone, FakeGit, FakeGh, FakeGl  # noqa: E402
 from load_stack import load_stack  # noqa: E402
 
 stack = load_stack()
@@ -512,6 +514,22 @@ class ForgeUnreachableTest(unittest.TestCase):
             stack.set_color(False)
         self.assertIn(red, out)
 
+    def test_loading_state_is_a_dim_ellipsis_not_net_off(self):
+        anc = chain("m0", "a1")
+        git = FakeGit(trunk_name="main",
+                      branch_tips={"main": "m0", "feat": "a1"}, ancestors=anc)
+        brs = {"feat": {"parent": "main", "base": "m0"}}
+        stack.set_color(True)
+        try:
+            dim, red = stack.ui.DIM, stack.ui.RED
+            out = render(git, brs, cur="feat", prs={}, pr_state="loading")
+        finally:
+            stack.set_color(False)
+        self.assertIn(stack.ui.SYM_LOADING, out)
+        self.assertNotIn(stack.ui.SYM_NET_OFF, out)
+        self.assertIn(dim, out)
+        self.assertNotIn(red, out)
+
     def test_wait_state_net_off_is_dim_not_red(self):
         anc = chain("m0", "a1")
         git = FakeGit(trunk_name="main",
@@ -734,6 +752,86 @@ class SyncGithubStackTest(unittest.TestCase):
             None, f, ["a", "b", "c"],
             {"a": _pr(10), "b": None, "c": _pr(12)}, dry=False)
         self.assertEqual(f.created, [[10, 12]])
+
+
+class PrintStacksLiveTest(unittest.TestCase):
+    """The two-frame print: the graph paints before the forge answers, then the
+    PR column is redrawn in place. Driven with FakeDone, so no real threads."""
+
+    CURSOR_UP = "\033["
+
+    def setUp(self):
+        anc = chain("m0", "a1")
+        self.git = FakeGit(trunk_name="main",
+                           branch_tips={"main": "m0", "feat": "a1"},
+                           ancestors=anc)
+        self.brs = {"feat": {"parent": "main", "base": "m0"}}
+        self.roots = stack.roots_of(self.brs)
+
+    def run_live(self, done, box, live=True):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            stack.print_stacks_live(self.git, self.brs, self.roots, "feat",
+                                    (done, box), stack.ui.SYM_GITHUB, "#", live)
+        return buf.getvalue()
+
+    def graph(self, pr_state, prs):
+        return stack.render_stacks(self.git, self.brs, self.roots, "feat", prs,
+                                   pr_state, forge_icon=stack.ui.SYM_GITHUB,
+                                   num_prefix="#")
+
+    def test_no_forge_prints_the_graph_once(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            stack.print_stacks_live(self.git, self.brs, self.roots, "feat",
+                                    None, stack.ui.SYM_GITHUB, "#", True)
+        out = buf.getvalue()
+        self.assertEqual(out, self.graph("off", {}) + "\n")
+        self.assertNotIn(self.CURSOR_UP, out)
+
+    def test_tty_prints_loading_then_redraws_resolved(self):
+        prs = {"feat": None}
+        done = FakeDone(True)
+        out = self.run_live(done, {"prs": prs})
+        loading = self.graph("loading", {})
+        resolved = self.graph("on", prs)
+        n_lines = loading.count("\n") + 1
+        self.assertEqual(
+            out, f"{loading}\n{stack.redraw_prefix(n_lines)}{resolved}\n")
+        self.assertEqual(done.waits, [stack._LIST_PR_TOTAL])
+
+    def test_fetch_that_fails_redraws_the_error_state(self):
+        out = self.run_live(FakeDone(True), {"prs": None})
+        self.assertTrue(out.endswith(self.graph("error", {}) + "\n"))
+
+    def test_fetch_that_never_lands_ends_in_wait_not_loading(self):
+        out = self.run_live(FakeDone(False), {})
+        self.assertTrue(out.endswith(self.graph("wait", {}) + "\n"))
+        self.assertIn(self.CURSOR_UP, out)
+
+    def test_non_tty_prints_once_with_no_cursor_codes(self):
+        prs = {"feat": None}
+        out = self.run_live(FakeDone(True), {"prs": prs}, live=False)
+        self.assertEqual(out, self.graph("on", prs) + "\n")
+        self.assertNotIn(self.CURSOR_UP, out)
+
+
+class CollectPrsTest(unittest.TestCase):
+    """The blocking collector used by the mutating commands, which must degrade
+    to "no PR here" rather than crash a half-done submit."""
+
+    def test_landed_fetch_returns_the_map(self):
+        prs = {"a": {"number": 1}}
+        self.assertEqual(stack.collect_prs((FakeDone(True), {"prs": prs}), ["a"]), prs)
+
+    def test_failed_fetch_falls_back_to_all_none(self):
+        got = stack.collect_prs((FakeDone(True), {"prs": None}), ["a", "b"])
+        self.assertEqual(got, {"a": None, "b": None})
+
+    def test_timed_out_fetch_falls_back_to_all_none(self):
+        done = FakeDone(False)
+        self.assertEqual(stack.collect_prs((done, {}), ["a"]), {"a": None})
+        self.assertEqual(done.waits, [stack._BLOCKING_PR_TOTAL])
 
 
 if __name__ == "__main__":

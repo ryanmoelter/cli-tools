@@ -142,6 +142,26 @@ class SquashMergeSyncTest(unittest.TestCase):
         stack.cmd_sync(self.git, forge, list(argv))
         return stack.load_state(self.git)[0]
 
+    def test_tracks_an_untracked_branch_with_an_open_pr(self):
+        """Fresh-clone recovery: a local branch with an open PR based on the
+        trunk gets adopted into the stack. The PR query is started before the
+        git fetches, so this also covers the overlapped-fetch path."""
+        git("switch", "-qc", "loose", "main", cwd=self.work)
+        loose_tip = commit(self.work, "loose-one")
+        forge = StackForge({
+            "b1": pr(1, "OPEN", self.b1_tip, "main"),
+            "loose": pr(9, "OPEN", loose_tip, "main"),
+        })
+        brs = self._sync(forge)
+        self.assertIn("loose", brs)
+        self.assertEqual(brs["loose"]["parent"], "main")
+
+    def test_does_not_track_a_branch_whose_pr_is_closed(self):
+        git("switch", "-qc", "loose", "main", cwd=self.work)
+        loose_tip = commit(self.work, "loose-one")
+        forge = StackForge({"loose": pr(9, "CLOSED", loose_tip, "main")})
+        self.assertNotIn("loose", self._sync(forge))
+
     def test_absorbs_parent_and_keeps_all_child_commits(self):
         # A commit lands on b2 after the merge: the replay range is bounded
         # below by the stored base and open above, so it rides along.

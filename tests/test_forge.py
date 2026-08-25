@@ -293,5 +293,14 @@ class ForgeDetectionTest(unittest.TestCase):
         self.assertIsNone(forge.gitlab_fullpath(None))
 
 
+class ResolvePrStateTest(unittest.TestCase):
+    def test_populated_box_is_on(self):
+        prs = {"main": {"number": 1}}
+        self.assertEqual(forge.resolve_pr_state({"prs": prs}), ("on", prs))
+
+    def test_failed_fetch_is_error(self):
+        self.assertEqual(forge.resolve_pr_state({"prs": None}), ("error", {}))
+
+
 if __name__ == "__main__":
     unittest.main()
