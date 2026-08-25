@@ -2,7 +2,8 @@
 
 A release spans two repos: this one (the source) and
 [homebrew-tap](https://github.com/ryanmoelter/homebrew-tap) (the formulas). Both are
-submodules of the dotfiles repo, so everything below can be done from `~/dotfiles`.
+submodules of the dotfiles repo, so everything below can be done from `~/dotfiles`. It
+ends with a GitHub release whose notes are Ryan's changelog text (steps 2 and 8).
 
 ## The one thing that fails silently
 
@@ -31,6 +32,12 @@ Commit whatever is going out, in `cli-tools/`.
 
 `tests/test_version.py` checks all three agree, so a missed one fails the suite rather
 than shipping.
+
+**Stop here and ask Ryan to write the changelog entries.** He owns all user-facing text,
+and this section becomes the GitHub release notes verbatim in step 8 — so it is his
+wording that ships, not a summary of the diff. An agent may bump the two version numbers
+and add the empty `## $V` heading, then wait. Do not draft the bullets, even as a
+placeholder.
 
 ### 3. Test, then tag
 
@@ -121,6 +128,31 @@ git push
 
 Without this a fresh `git clone --recurse-submodules` of the dotfiles repo still checks out
 the previous version.
+
+### 8. Publish the GitHub release
+
+The release notes are the changelog section for this version, used as-is:
+
+```sh
+cd ~/dotfiles/cli-tools
+python3 - "$V" <<'EOF' > /tmp/notes-$V.md
+import re, sys
+ver = sys.argv[1]
+body = open("CHANGELOG.md").read()
+m = re.search(rf"^## {re.escape(ver)}\n(.*?)(?=^## |\Z)", body, re.M | re.S)
+if not m:
+    sys.exit(f"no ## {ver} section in CHANGELOG.md")
+print(m.group(1).strip())
+EOF
+gh release create "v$V" --title "v$V" --notes-file /tmp/notes-$V.md --verify-tag
+gh release view "v$V"
+```
+
+`--verify-tag` makes the command fail if the tag is missing rather than creating one, so a
+skipped step 3 cannot invent a release off the wrong commit. Publishing a release does not
+move the tag or change the tarball — the `sha256` in the formulas stays valid.
+
+One release covers both tools: they ship from this repo's single tarball.
 
 ## Notes
 
