@@ -76,7 +76,7 @@ class RestackRepoTest(unittest.TestCase):
 
     def write_state(self, brs):
         os.makedirs(stack.stack_dir(self.git), exist_ok=True)
-        stack.save_state(self.git, brs, True)
+        stack.save_state(self.git, brs)
 
 
 class MergedInTrunkTest(RestackRepoTest):

@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+- Fix `stack` repeatedly warning `pruned deleted branch '<name>' from stack state` on every command: the cleanup is now written back the first time it's noticed, instead of only in memory
+
 ## 0.1.2
 - `stack list` is now quicker, showing the local state first and filling in the remote/PR/MR state once the network calls finish (matching `wt list`)
 - `stack submit` and `stack sync` complete faster by running their PR/MR queries in parallel with other actions

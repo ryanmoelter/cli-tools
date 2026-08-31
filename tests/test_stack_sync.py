@@ -134,7 +134,7 @@ class SquashMergeSyncTest(unittest.TestCase):
 
     def _write_state(self, brs):
         os.makedirs(stack.stack_dir(self.git), exist_ok=True)
-        stack.save_state(self.git, brs, True)
+        stack.save_state(self.git, brs)
 
     def _sync(self, forge, argv=()):
         git("switch", "-q", "b2", cwd=self.work)

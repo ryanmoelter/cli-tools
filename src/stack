@@ -101,10 +101,10 @@ def state_path(git):
 
 
 def load_state(git):
-    """→ (brs, dirty): {branch: {"parent","base"}} plus whether it already
-    needs saving (legacy one-file-per-stack state is merged and deleted
-    branches are pruned in memory here; the next mutating command persists
-    the cleanup)."""
+    """→ (brs, dirty): {branch: {"parent","base"}} plus whether the on-disk
+    state needs repairing (legacy one-file-per-stack state is merged and
+    deleted branches are pruned, both in memory only). Prefer
+    `load_and_flush`, which persists the repair."""
     brs, dirty = {}, False
     d = stack_dir(git)
     files = sorted(os.listdir(d)) if os.path.isdir(d) else []
@@ -142,9 +142,7 @@ def load_state(git):
     return brs, dirty
 
 
-def save_state(git, brs, dirty=True):
-    if not dirty:
-        return
+def save_state(git, brs):
     d = stack_dir(git)
     os.makedirs(d, exist_ok=True)
     for fn in os.listdir(d):  # retire legacy per-stack files
@@ -170,6 +168,22 @@ def state_lock(git):
     with open(os.path.join(d, "lock"), "w") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
         yield
+
+
+def load_and_flush_locked(git):
+    """→ brs, with any repair `load_state` found written back. The caller
+    already holds the state lock."""
+    brs, dirty = load_state(git)
+    if dirty:
+        save_state(git, brs)
+    return brs
+
+
+def load_and_flush(git):
+    """`load_and_flush_locked` for callers that don't hold the lock. The lock
+    is not reentrant, so never call this from inside a `state_lock` block."""
+    with state_lock(git):
+        return load_and_flush_locked(git)
 
 
 # -------- stack graph (pure functions over the branch map) --------
@@ -613,7 +627,7 @@ def cmd_list(git, forge, argv):
             no_pr = True
         else:
             die(f"unknown argument: {a}")
-    brs, _dirty = load_state(git)
+    brs = load_and_flush(git)
     cur = git.current_branch()
     if not brs:
         die("no stacks tracked yet — `stack create <name>` or `stack track`")
@@ -701,7 +715,7 @@ def cmd_create(git, forge, argv):
     if not cur:
         die("detached HEAD — check out a branch first")
     with state_lock(git):
-        brs, _dirty = load_state(git)
+        brs = load_and_flush_locked(git)
         if cur not in brs and cur != git.trunk():
             die(f"'{cur}' is not in a stack — run `stack track` first")
         if insert and cur not in brs:
@@ -723,7 +737,7 @@ def cmd_split(git, forge, argv):
     if not cur:
         die("detached HEAD — check out a branch first")
     with state_lock(git):
-        brs, _dirty = load_state(git)
+        brs = load_and_flush_locked(git)
         entry = brs.get(cur)
         if entry is None:
             die(f"'{cur}' is not in a stack — run `stack track` first")
@@ -886,14 +900,13 @@ def cmd_track(git, forge, argv):
     if branch == git.trunk():
         die(f"'{branch}' is the trunk — it can't be part of a stack")
     with state_lock(git):
-        brs, dirty = load_state(git)
+        brs = load_and_flush_locked(git)
         if parent is not None:
             track_with_parent(git, brs, branch, parent)
         else:
             entry = brs.get(branch)
             if entry is not None:
                 print(f"'{branch}' is already tracked (parent: {entry['parent']}) — use --parent to move it")
-                save_state(git, brs, dirty)
                 return
             track_chain(git, brs, branch)
         save_state(git, brs)
@@ -906,11 +919,10 @@ def cmd_untrack(git, forge, argv):
     if not branch:
         die("detached HEAD — pass a branch name")
     with state_lock(git):
-        brs, dirty = load_state(git)
+        brs = load_and_flush_locked(git)
         entry = brs.get(branch)
         if entry is None:
             print(f"'{branch}' is not tracked — nothing to do")
-            save_state(git, brs, dirty)
             return
         parent = entry["parent"]
         for e in brs.values():
@@ -932,7 +944,7 @@ def cmd_checkout(git, forge, argv):
             die(f"no local branch '{argv[0]}'")
         git.switch_to(argv[0])
         return
-    brs, _dirty = load_state(git)
+    brs = load_and_flush(git)
     if not brs:
         die("no stacks tracked yet")
     cur = git.current_branch()
@@ -949,7 +961,7 @@ def nav_context(git):
     """→ (cur, brs, entry) with brs scoped to one stack's tree. From an
     untracked branch (e.g. trunk), fall back to the only stack when there's
     exactly one."""
-    brs, _dirty = load_state(git)
+    brs = load_and_flush(git)
     cur = git.current_branch()
     if not cur:
         die("detached HEAD — check out a branch first")
@@ -1141,7 +1153,7 @@ def cmd_restack(git, forge, argv):
     if not dry:
         restack_preflight(git)
     with state_lock(git):
-        brs, dirty = load_state(git)
+        brs = load_and_flush_locked(git)
         cur = require_current_tracked(git, brs)
         if interactive:
             interactive_restack(git, brs, cur)  # saves state itself on success
@@ -1150,7 +1162,7 @@ def cmd_restack(git, forge, argv):
         members = subtree(brs, root_of(brs, cur)) if all_ else path_to(brs, cur)
         results = restack_stack(git, brs, members, dry, include_trunk)
         if not dry:
-            save_state(git, brs, dirty)
+            save_state(git, brs)
     if not dry and git.current_branch() != cur:
         git.switch_to(cur, quiet=True)
     for b, action in results:
@@ -1264,7 +1276,7 @@ def cmd_submit(git, forge, argv):
     require_forge(forge)
     noun = forge.NOUN
     num = forge.NUM_PREFIX
-    all_brs, _dirty = load_state(git)
+    all_brs = load_and_flush(git)
     cur = require_current_tracked(git, all_brs)
     order = subtree(all_brs, root_of(all_brs, cur)) if all_ else path_to(all_brs, cur)
     brs = {x: all_brs[x] for x in order}
@@ -1331,8 +1343,9 @@ def cmd_sync(git, forge, argv):
     # Start the untracked-branch query up front so it overlaps the git fetches
     # below. State is read once here just to scope the query; the authoritative
     # load happens under the lock, and anything tracked meanwhile is filtered
-    # out there.
-    known = load_state(git)[0]
+    # out there. Reading through the flush keeps a stale entry from adding a
+    # deleted branch to the query.
+    known = load_and_flush(git)
     candidates = [b for b in git.local_branches()
                   if b != git.trunk() and b not in known]
     untracked_fetch = start_fetch(forge.prs_for_or_none, candidates)
@@ -1343,7 +1356,7 @@ def cmd_sync(git, forge, argv):
     git.run(["git", "fetch", "origin", f"{git.trunk()}:{git.trunk()}"], check=False)
     had_errors = False
     with state_lock(git):
-        brs, dirty = load_state(git)
+        brs = load_and_flush_locked(git)
 
         # Track local branches that have open PRs/MRs (fresh-clone recovery).
         untracked_prs = {b: pr for b, pr in collect_prs(untracked_fetch, candidates).items()
@@ -1358,7 +1371,6 @@ def cmd_sync(git, forge, argv):
                 if baseref == git.trunk() or baseref in brs:
                     print(("would track" if dry else "tracking") + f" '{b}' ({noun} {num}{pr['number']}, base {baseref})")
                     track_with_parent(git, brs, b, baseref, announce=False)
-                    dirty = True
                     changed = True
 
         # Absorb squash-merged PRs/MRs.
@@ -1392,7 +1404,6 @@ def cmd_sync(git, forge, argv):
                         warn(f"could not delete '{b}'"
                              + (f" — checked out in {wt}" if wt else f": {(dp.stderr or '').strip()}"))
                 del brs[b]
-                dirty = True
 
         # Scope the mutating phases (restack, push, retarget). Tracking and
         # absorption above stay global — they only add tracking or delete
@@ -1422,7 +1433,7 @@ def cmd_sync(git, forge, argv):
             for b, action in restack_stack(git, brs, members, dry, include_trunk=True):
                 print(f"  {b}: {action}")
         if not dry:
-            save_state(git, brs, dirty)
+            save_state(git, brs)
         if push:
             pushable = [b for root in roots_of(brs) for b in subtree(brs, root) if in_scope(b)]
             # Re-read PR state: the maps above predate absorption, and on a
