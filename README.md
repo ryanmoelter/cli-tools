@@ -40,7 +40,7 @@ background|bg [name] [--no-tab|--workspace]
                                      relocate current branch + changes to a new worktree
 list|l        [--json] [--paths]     show worktrees + change/PR markers
 delete|d      <name> [-f|--force]    remove worktree (branch left intact)
-prune|p       [-y|--yes]             delete worktrees whose PR/MR is merged or closed
+prune|p       [-y|--yes]             delete merged worktrees, then merged branches
 rename|r      [name] <new> [-f|--folder]
                                      rename branch (optionally folder too)
 commit|cm     <name> [git-args]      commit -a in another worktree

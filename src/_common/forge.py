@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from gitcore import die, run_
 
@@ -137,6 +138,10 @@ _GITHUB_PR_NODE = (
 # histories), but an unbounded alias count would eventually hit query limits.
 CHUNK = 30
 
+# Concurrent chunk requests. Enough to hide latency on a repo with many
+# branches without opening a burst the forge's rate limiter would notice.
+CHUNK_WORKERS = 4
+
 
 def build_github_query(branches):
     """→ (query string, {alias: branch}). Branch names are inlined as JSON
@@ -220,25 +225,40 @@ def _chunks(seq, n):
     return [seq[i:i + n] for i in range(0, len(seq), n)]
 
 
+def _fetch_github_chunk(chunk, cwd):
+    """One chunk's {branch: pr|None}, or None on any failure."""
+    q, alias_to_branch = build_github_query(chunk)
+    p = run_(
+        ["gh", "api", "graphql", "-f", f"query={q}",
+         "-F", "owner={owner}", "-F", "name={repo}"],
+        check=False, cwd=cwd,
+    )
+    if p.returncode != 0:
+        return None
+    try:
+        data = json.loads(p.stdout)
+    except json.JSONDecodeError:
+        return None
+    return normalize_github(data, alias_to_branch)
+
+
 def fetch_github_prs(branches, cwd=None):
     """{branch: pr dict | None} in one batched GraphQL request per CHUNK, or
     None when any request fails (offline, unauthed) — callers that render a
-    PR column can then drop it instead of showing every branch as PR-less."""
+    PR column can then drop it instead of showing every branch as PR-less.
+
+    Chunks run concurrently: the requests are independent and latency-bound, so
+    a branch list long enough to need several costs about as much as one."""
+    chunks = _chunks(list(branches), CHUNK)
+    if len(chunks) == 1:
+        return _fetch_github_chunk(chunks[0], cwd)
+    with ThreadPoolExecutor(max_workers=CHUNK_WORKERS) as pool:
+        results = list(pool.map(lambda c: _fetch_github_chunk(c, cwd), chunks))
+    if any(r is None for r in results):
+        return None
     out = {}
-    for chunk in _chunks(list(branches), CHUNK):
-        q, alias_to_branch = build_github_query(chunk)
-        p = run_(
-            ["gh", "api", "graphql", "-f", f"query={q}",
-             "-F", "owner={owner}", "-F", "name={repo}"],
-            check=False, cwd=cwd,
-        )
-        if p.returncode != 0:
-            return None
-        try:
-            data = json.loads(p.stdout)
-        except json.JSONDecodeError:
-            return None
-        out.update(normalize_github(data, alias_to_branch))
+    for r in results:
+        out.update(r)
     return out
 
 

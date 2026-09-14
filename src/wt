@@ -30,7 +30,7 @@ Subcommands:
                                        relocate current branch + changes to a new worktree
   list|l        [--json] [--paths]     show worktrees + change/PR markers
   delete|d      <name> [-f|--force]    remove worktree (branch left intact)
-  prune|p       [-y|--yes]             delete worktrees whose PR/MR is merged or closed
+  prune|p       [-y|--yes]             delete merged worktrees, then merged branches
   rename|r      [name] <new> [-f|--folder]
                                        rename branch (optionally folder too)
   commit|cm     <name> [git-args]      commit -a in another worktree
@@ -90,7 +90,7 @@ import ui
 from forge import (
     fetch_github_prs, fetch_gitlab_prs, resolve_pr_state, start_fetch,
 )
-from gitcore import die, run_
+from gitcore import die, run_, warn
 from ui import (  # noqa: F401 (set_color/redraw_prefix re-exported for tests)
     branch_pr_chip, pr_chip, pr_loading_chip, pr_net_off_chip, redraw_prefix,
     set_color,
@@ -374,6 +374,12 @@ class WtGit(gitcore.ConfigMixin):
     def branch_exists(self, b):
         return self.silent_ok(self._repo_git("show-ref", "--verify", f"refs/heads/{b}"))
 
+    def ref_exists(self, ref):
+        return self.silent_ok(self._repo_git("rev-parse", "--verify", "--quiet", ref))
+
+    def is_ancestor(self, ref, of_ref):
+        return self.silent_ok(self._repo_git("merge-base", "--is-ancestor", ref, of_ref))
+
     def local_branches(self):
         out = self.out_or_none(
             self._repo_git("for-each-ref", "--format=%(refname:short)", "refs/heads")
@@ -432,6 +438,9 @@ class WtGit(gitcore.ConfigMixin):
 
     def branch_delete(self, branch, force=False):
         self.visible_fatal(self._repo_git("branch", "-D" if force else "-d", branch))
+
+    def branch_delete_ok(self, branch, force=False):
+        return self.visible_ok(self._repo_git("branch", "-D" if force else "-d", branch))
 
     def worktree_move(self, old_path, new_path):
         self.visible_fatal(self._repo_git("worktree", "move", old_path, new_path))
@@ -849,7 +858,7 @@ usage: {B}wt <command> [args]{R}
   {B}wt path          <name|branch>{R}         print its path (scripts, other shells)
   {B}wt current       [--json]{R}              report the cwd's worktree + branch
   {B}wt delete|d      <name> [-f|--force]{R}   remove worktree (branch left intact)
-  {B}wt prune|p       [-y|--yes]{R}            delete worktrees whose PR/MR is merged or closed
+  {B}wt prune|p       [-y|--yes]{R}            delete merged worktrees, then merged branches
   {B}wt setup{R}                               interactively configure ryanmoelter-cli-tools.*
   {B}wt init zsh{R}                            print shell integration for eval in .zshrc
   {B}wt help{R}                                show this message
@@ -900,10 +909,13 @@ Current config (resolved), set via `wt setup` or `git config {shared}.*`:
 # (offline, unauthed, unrecognized remote) simply omits the column.
 
 
-def start_pr_fetch(ctx):
+def start_pr_fetch(ctx, all_branches=False):
     """Kick off the PR fetch on a daemon thread. → (done event, result box,
     number prefix, forge icon) or None when there's nothing to fetch. The box
-    holds "prs": {branch: pr|None} on success, or None on failure."""
+    holds "prs": {branch: pr|None} on success, or None on failure.
+
+    all_branches widens the query past the checked-out branches, for prune,
+    which also judges branches that have no worktree."""
     kind = forge_kind(ctx)
     if kind == "github":
         if not shutil.which("gh"):
@@ -924,7 +936,8 @@ def start_pr_fetch(ctx):
     # Asking only for our checked-out branches keeps the query small enough to
     # be fast (`gh pr list` with statusCheckRollup 504s on repos with big PR
     # histories).
-    branches = [b for b, _ in ctx.git.worktree_records()]
+    branches = (ctx.git.local_branches() if all_branches
+                else [b for b, _ in ctx.git.worktree_records()])
     if not branches:
         return None
 
@@ -975,10 +988,30 @@ def build_rows(ctx):
     return rows
 
 
-def prune_candidates(records, prs, protected, cwd_name, base_branch):
+def is_merged_locally(git, branch, base_ref):
+    """True when base_ref already contains branch's commits outright.
+
+    Only catches fast-forward and rebase merges. A squash merge rewrites the
+    change onto current trunk, so its commits never appear here and no local
+    check can find it — the forge's PR state is what identifies those."""
+    return git.is_ancestor(branch, base_ref)
+
+
+def _merge_reason(pr, branch, locally_merged, base_branch):
+    """Why a branch is prunable — the PR's state, or a local merge into the
+    base — or None when it isn't."""
+    if pr and pr["state"] in ("MERGED", "CLOSED"):
+        return pr["state"].lower()
+    if locally_merged(branch):
+        return f"merged into {base_branch}"
+    return None
+
+
+def prune_candidates(records, prs, protected, cwd_name, base_branch, locally_merged):
     """records: [(branch, wt_path)] from git.worktree_records(). → the subset
-    [(name, branch, wt_path, pr)] whose PR/MR is MERGED or CLOSED, excluding
-    protected worktrees, the cwd worktree, and the base branch.
+    [(name, branch, wt_path, pr, reason)] whose PR/MR is MERGED or CLOSED or
+    whose branch is already merged into the base, excluding protected
+    worktrees, the cwd worktree, and the base branch.
 
     name is the path's basename, used only to describe and protect the
     candidate; deletion goes by path, so a name shared with another worktree
@@ -989,8 +1022,28 @@ def prune_candidates(records, prs, protected, cwd_name, base_branch):
         if name in protected or name == cwd_name or branch == base_branch:
             continue
         pr = prs.get(branch)
-        if pr and pr["state"] in ("MERGED", "CLOSED"):
-            out.append((name, branch, wt_path, pr))
+        reason = _merge_reason(pr, branch, locally_merged, base_branch)
+        if reason:
+            out.append((name, branch, wt_path, pr, reason))
+    return out
+
+
+def bare_branch_candidates(branches, worktree_branches, prs, current_branch,
+                           trunk_branches, base_branch, locally_merged):
+    """Local branches with no worktree that are safe to delete →
+    [(branch, pr, reason)].
+
+    Guards on trunk_branches rather than the protected list, which names
+    worktree folders and so has nothing to say about a branch without one."""
+    skip = set(worktree_branches) | set(trunk_branches) | {current_branch}
+    out = []
+    for branch in branches:
+        if branch in skip:
+            continue
+        pr = prs.get(branch)
+        reason = _merge_reason(pr, branch, locally_merged, base_branch)
+        if reason:
+            out.append((branch, pr, reason))
     return out
 
 
@@ -1441,40 +1494,84 @@ def cmd_prune(ctx, argv):
         else:
             die(f"unknown flag: {a}")
 
-    fetch = start_pr_fetch(ctx)
+    # A squash merge leaves no local trace, so PR/MR state is the signal that
+    # finds most merged branches. Losing it costs coverage, not correctness —
+    # prune carries on with what git alone can prove.
+    prs = {}
+    fetch = start_pr_fetch(ctx, all_branches=True)
     if fetch is None:
-        die("prune needs PR/MR status — no forge configured or gh/glab missing")
-    done, box, num_prefix, forge_icon = fetch
-    done.wait(30)  # prune is deliberate; block for the fetch, don't time out at 1s
-    prs = box.get("prs")
-    if prs is None:
-        die("could not fetch PR/MR status; aborting prune")
+        warn("no PR/MR status (no forge configured or gh/glab missing) — "
+             "only locally merged branches will be found")
+        num_prefix, forge_icon = "#", None
+    else:
+        done, box, num_prefix, forge_icon = fetch
+        done.wait(30)  # prune is deliberate; block for the fetch, don't time out at 1s
+        fetched = box.get("prs")
+        if fetched is None:
+            warn("could not fetch PR/MR status — "
+                 "only locally merged branches will be found")
+        else:
+            prs = fetched
 
+    ctx.git.fetch_base(ctx.base_branch, quiet=True)
+    remote_base = f"origin/{ctx.base_branch}"
+    base_ref = remote_base if ctx.git.ref_exists(remote_base) else ctx.base_branch
+    locally_merged = lambda b: is_merged_locally(ctx.git, b, base_ref)  # noqa: E731
+
+    records = ctx.git.worktree_records()
     cwd_name = ctx.current_worktree_name_or_none()
     candidates = prune_candidates(
-        ctx.git.worktree_records(), prs, ctx.protected, cwd_name, ctx.base_branch
+        records, prs, ctx.protected, cwd_name, ctx.base_branch, locally_merged
     )
-    if not candidates:
-        print("wt: nothing to prune")
-        return
 
+    def chip_for(pr):
+        return pr_chip(pr, num_prefix, forge_icon)[0] if pr else ""
+
+    deleted_branches = set()
     skipped = []
-    for name, branch, wt_path, pr in candidates:
-        chip = pr_chip(pr, num_prefix, forge_icon)[0]
+    for name, branch, wt_path, pr, reason in candidates:
+        chip = chip_for(pr)
         if not ctx.git.is_clean(wt_path):
             skipped.append(name)
             print(f"  skip {name}  {chip}  (uncommitted changes)")
             continue
         if not auto_yes:
-            reply = _read_reply(f"  delete {name} ({branch})  {chip}? [y/N]> ").strip()
+            reply = _read_reply(
+                f"  delete {name} ({branch})  {chip} {reason}? [y/N]> ").strip()
             if reply not in ("y", "Y", "yes", "YES"):
                 continue
         ctx.git.worktree_remove(wt_path)
         ctx.git.branch_delete(branch, force=True)
+        deleted_branches.add(branch)
         print(f"wt: deleted worktree {name} and branch {branch}")
 
     if skipped:
         print(f"wt: skipped (uncommitted changes): {', '.join(skipped)}")
+
+    # Branches whose worktree is gone (or never existed) are invisible to the
+    # phase above, so they accumulate indefinitely without this one.
+    _, cwd_path = ctx.current_worktree_or_none()
+    current_branch = ctx.git.branch_of(cwd_path) if cwd_path else None
+    live_branches = [b for b, _ in records if b not in deleted_branches]
+    bare = bare_branch_candidates(
+        ctx.git.local_branches(), live_branches, prs, current_branch,
+        ctx.trunk_branches, ctx.base_branch, locally_merged
+    )
+
+    if not candidates and not bare:
+        print("wt: nothing to prune")
+        return
+
+    for branch, pr, reason in bare:
+        chip = chip_for(pr)
+        if not auto_yes:
+            reply = _read_reply(
+                f"  delete branch {branch}  {chip} {reason}? [y/N]> ").strip()
+            if reply not in ("y", "Y", "yes", "YES"):
+                continue
+        # One stubborn branch shouldn't abandon the rest of a long run.
+        if ctx.git.branch_delete_ok(branch, force=True):
+            print(f"wt: deleted branch {branch}")
 
 
 def cmd_rename(ctx, argv):
@@ -1908,8 +2005,8 @@ _wt() {
     's:cd to a worktree or checked-out branch'
     'delete:remove worktree (branch left intact)'
     'd:remove worktree (branch left intact)'
-    'prune:delete worktrees whose PR/MR is merged or closed'
-    'p:delete worktrees whose PR/MR is merged or closed'
+    'prune:delete merged worktrees, then merged branches'
+    'p:delete merged worktrees, then merged branches'
     'setup:interactively configure options'
     'help:show usage + resolved config'
   )

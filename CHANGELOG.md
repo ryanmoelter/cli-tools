@@ -1,6 +1,9 @@
 # Changelog
 
 ## Unreleased
+- `wt prune` now also deletes merged branches that have no worktree, which previously accumulated forever
+- `wt prune` no longer aborts when `gh`/`glab` is unavailable — it warns and falls back to the branches git can prove are merged
+- `wt` and `stack` fetch PR/MR status faster on repos with many branches, by running the batched queries in parallel
 - Fix `stack` repeatedly warning `pruned deleted branch '<name>' from stack state` on every command: the cleanup is now written back the first time it's noticed, instead of only in memory
 
 ## 0.1.2
