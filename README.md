@@ -73,7 +73,7 @@ checkout|co [<branch>]                 switch to a stack branch
 prev | next | first | last             navigate the stack
 restack [--all] [--trunk] [-i] [--dry-run]  rebase current branch + ancestors onto their parents
 submit [--all] [--ready] [--dry-run]   push + create/retarget PRs for current + ancestors
-sync [--all] [--push] [--dry-run]      fetch + absorb merged PRs + restack current + ancestors
+sync [--all] [--trunk] [--push] [--dry-run]  fetch + absorb merged PRs + restack current + ancestors
 setup                                  interactively configure options
 __complete <what>                      hidden: completion candidates
 ```

@@ -242,6 +242,39 @@ class SquashMergeSyncTest(unittest.TestCase):
                           brs["b2"]["parent"], False)
         self.assertEqual(forge.edits, [(2, "main")])
 
+    def _advance_trunk(self):
+        """Land an unrelated commit on origin's trunk; → its sha."""
+        git("switch", "-q", "main", cwd=self.work)
+        sha = commit(self.work, "trunk-moved")
+        git("push", "-q", "origin", "main", cwd=self.work)
+        return sha
+
+    def test_leaves_the_root_behind_a_moved_trunk_by_default(self):
+        """Being behind a fast-moving trunk isn't a restack, so plain `sync`
+        must not rebase the root onto it — same rule as `stack restack`."""
+        moved = self._advance_trunk()
+        forge = StackForge({"b1": pr(1, "OPEN", self.b1_tip, "main"),
+                            "b2": pr(2, "OPEN", self.b2_tip, "b1")})
+        brs = self._sync(forge)
+
+        self.assertEqual(self.git.rev("b1"), self.b1_tip)
+        self.assertFalse(self.git.is_ancestor(moved, self.git.rev("b1")))
+        self.assertEqual(brs["b1"]["base"], self.trunk0)
+
+    def test_trunk_flag_rebases_the_root_onto_the_moved_trunk(self):
+        moved = self._advance_trunk()
+        forge = StackForge({"b1": pr(1, "OPEN", self.b1_tip, "main"),
+                            "b2": pr(2, "OPEN", self.b2_tip, "b1")})
+        brs = self._sync(forge, ["--trunk"])
+
+        self.assertTrue(self.git.is_ancestor(moved, self.git.rev("b1")))
+        self.assertTrue(self.git.is_ancestor(moved, self.git.rev("b2")))
+        self.assertEqual(brs["b1"]["base"], moved)
+        # b2 rides along on its parent, keeping its own commits exactly once.
+        got = subjects(self.work, "b2")
+        self.assertEqual(got[:2], ["b2-two", "b2-one"])
+        self.assertEqual(brs["b2"]["base"], self.git.rev("b1"))
+
     def test_replay_excludes_reworked_parent_commits(self):
         """The case where the stored base genuinely carries the weight.
 

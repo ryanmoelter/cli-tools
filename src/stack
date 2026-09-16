@@ -1331,7 +1331,9 @@ def cmd_sync(git, forge, argv):
     push = "--push" in argv
     dry = "--dry-run" in argv
     all_ = "--all" in argv
-    leftover = [a for a in argv if a not in ("--push", "--dry-run", "--all")]
+    include_trunk = "--trunk" in argv
+    leftover = [a for a in argv
+                if a not in ("--push", "--dry-run", "--all", "--trunk")]
     if leftover:
         die(f"unknown argument: {leftover[0]}")
     require_forge(forge)
@@ -1430,7 +1432,8 @@ def cmd_sync(git, forge, argv):
             if skipped & set(subtree(brs, root)):
                 continue
             members = [b for b in subtree(brs, root) if b in scoped]
-            for b, action in restack_stack(git, brs, members, dry, include_trunk=True):
+            for b, action in restack_stack(git, brs, members, dry,
+                                           include_trunk=include_trunk):
                 print(f"  {b}: {action}")
         if not dry:
             save_state(git, brs)
@@ -1619,7 +1622,7 @@ Maintain
         reviewers the stack navigator in the PR UI) and extended as it grows;
         a forking stack or one whose order disagrees with GitHub's is left
         alone with a note. Best-effort — the PRs are unaffected if it fails.
-  {ui.BOLD}sync [--all] [--push] [--dry-run]{ui.RESET}
+  {ui.BOLD}sync [--all] [--trunk] [--push] [--dry-run]{ui.RESET}
         Fetch; start tracking local branches that have open PRs/MRs; absorb
         squash-merged ones (delete the local branch, reparent children onto
         its parent). Then restack — by default only the current branch and its
@@ -1627,8 +1630,11 @@ Maintain
         they're usually checked out in other worktrees and can't be moved from
         here; --all restacks every stack. Tracking and absorption always scan
         every stack (they only add tracking or drop already-merged branches).
-        With --push, also force-push and retarget bases for the same scoped
-        branches (never creates PRs/MRs — that's `submit`).
+        As with `restack`, the stack root is left where it sits relative to
+        trunk unless --trunk is given; a root whose base has fallen off trunk
+        is moved regardless. With --push, also force-push and retarget bases
+        for the same scoped branches (never creates PRs/MRs — that's
+        `submit`).
 
   {ui.BOLD}setup{ui.RESET}                     Interactively configure ryanmoelter-cli-tools.* git config.
   {ui.BOLD}help{ui.RESET}                      Show this text.
