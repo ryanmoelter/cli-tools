@@ -40,9 +40,11 @@ GitHub's native stacked PRs are used additively, never as the source of truth:
 `submit` registers the chain so reviewers get the stack navigator, and `list`
 shows membership. Rebasing still runs off the local `base` above — GitHub's
 headRefOid/base describe the PR, ours records what has already been replayed,
-and adopting theirs would drop that lower bound. Their model is a flat ordered
-list and their local state is per-worktree, so it can represent neither our
-forking trees nor our worktree-shared state; ours stays authoritative.
+and adopting theirs would drop that lower bound. (A remote head that already
+holds our replay is adopted as a commit — see remote_restack — but the base we
+record is still our own.) Their model is a flat ordered list and their local
+state is per-worktree, so it can represent neither our forking trees nor our
+worktree-shared state; ours stays authoritative.
 
 Exit codes: 0 ok · 1 error · 3 restack stopped on a rebase conflict
 """
@@ -1026,7 +1028,71 @@ def restack_preflight(git):
         die("working tree not clean — commit or stash first")
 
 
-def restack_stack(git, brs, members, dry, include_trunk=False):
+def origin_tip(git, b):
+    """origin/<b>'s sha as of the last fetch, or None. Local only."""
+    p = git.run(["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{b}"],
+                check=False)
+    return p.stdout.strip() if p.returncode == 0 else None
+
+
+def remote_restack(git, b, ptip, floor):
+    """When origin/<b> already holds `b` replayed onto `ptip` — a forge that
+    restacks a stack server-side after its bottom PRs merge — → (onto, floor)
+    that rebases `b` onto the remote head instead, replaying only the local
+    commits it lacks. None when the remote has no equivalent restack.
+
+    Equivalence is by tree: `b`'s own commits are dry-replayed onto `ptip`
+    with merge-tree (no refs or worktree touched), and the last step whose
+    tree matches a commit on the remote's first-parent line marks how much of
+    `b` the remote already has. Remote commits past that point (a CI bot's)
+    mean local is behind, not diverged, so they're kept. Local commits past it
+    are replayed only when that point was the pushed head."""
+    rtip = origin_tip(git, b)
+    if not rtip or rtip == git.rev(b) or not git.is_ancestor(ptip, rtip):
+        return None
+    remote_trees = set(git.git("log", "--first-parent", "--format=%T",
+                               f"{ptip}..{rtip}").split())
+    cur, keep = ptip, None
+    for c in git.git("rev-list", "--reverse", "--no-merges", f"{floor}..{b}").split():
+        p = git.run(["git", "merge-tree", "--write-tree", f"--merge-base={c}^", cur, c],
+                    check=False)
+        if p.returncode != 0:  # conflict: the real rebase would stop here too
+            break
+        tree = p.stdout.split()[0]
+        if tree in remote_trees:
+            keep = c
+        p = git.run(["git", "commit-tree", tree, "-p", cur, "-m", "stack dry replay"],
+                    check=False)
+        if p.returncode != 0:
+            break
+        cur = p.stdout.strip()
+    if not keep:
+        return None
+    if keep != git.rev(b) and keep not in former_origin_tips(git, b):
+        # The unmatched commits might be unpushed, or ones the remote rewrote;
+        # only a record of `keep` as the pushed head says which.
+        return None
+    return rtip, keep
+
+
+def former_origin_tips(git, b):
+    """Every sha origin/<b> has pointed at locally (push and fetch both log it)."""
+    p = git.run(["git", "reflog", "show", "--format=%H", f"refs/remotes/origin/{b}"],
+                check=False)
+    return set(p.stdout.split()) if p.returncode == 0 else set()
+
+
+def rebase_branch(git, b, onto, floor, wt):
+    """`git rebase --onto onto floor b`, run inside `wt` when `b` is checked
+    out in another worktree (it can't be checked out here too)."""
+    cmd = ["git"] + (["-C", wt] if wt else [])
+    cmd += ["-c", "rebase.updateRefs=false", "rebase", "--onto", onto, floor]
+    if not wt:
+        cmd.append(b)
+    return git.run(cmd, capture=False, check=False)
+
+
+def restack_stack(git, brs, members, dry, include_trunk=False, adopted=None):
     """Rebase each branch in `members` (a pre-ordered, parents-first list) onto
     its parent. Saves state incrementally; exits EXIT_CONFLICT on a
     conflict. → [(branch, action)]
@@ -1038,14 +1104,18 @@ def restack_stack(git, brs, members, dry, include_trunk=False):
 
     Each branch replays from its fork point off the parent (see replay_floor),
     so a branch that merged its parent in rather than rebasing replays only its
-    own commits, not the range it merged."""
+    own commits, not the range it merged. A branch whose remote head already
+    holds that replay is adopted instead (see remote_restack), so pushing it
+    afterward is a no-op rather than a force-push of equivalent commits.
+    Branches that end up exactly at origin/<b> are added to `adopted`."""
     wmap = git.worktree_map()
     cur_wt = git.git("rev-parse", "--show-toplevel")
-    moved = set()
+    moved = set()      # dry run: rebased, so the new tip is unknown
+    predicted = {}     # dry run: adopted, so the new tip is origin/<b>
     results = []
     for b in members:
         pname = brs[b]["parent"]
-        ptip = parent_tip(git, brs, b)
+        ptip = predicted.get(pname) or parent_tip(git, brs, b)
         # A root sitting cleanly on trunk isn't moved onto the latest trunk
         # unless asked (--trunk) or forced (base fell off trunk).
         note = ""
@@ -1065,30 +1135,53 @@ def restack_stack(git, brs, members, dry, include_trunk=False):
                     save_state(git, brs)
             results.append((b, "already stacked"))
             continue
-        if dry:
+        if dry and pname in moved:
             results.append((b, f"would rebase onto {pname}{note}"))
             moved.add(b)
             continue
+        floor = replay_floor(git, brs, b, ptip)
+        adopt = remote_restack(git, b, ptip, floor)
+        if dry:
+            if not adopt:
+                results.append((b, f"would rebase onto {pname}{note}"))
+                moved.add(b)
+            elif adopt[1] == git.rev(b):
+                results.append((b, f"would adopt origin/{b} (already restacked on the remote)"))
+                predicted[b] = adopt[0]
+                if adopted is not None:
+                    adopted.add(b)
+            else:
+                n = git.rev_list_count(f"{adopt[1]}..{b}")
+                results.append((b, f"would adopt origin/{b} (already restacked on the "
+                                   f"remote) and replay {n} local commit(s)"))
+                moved.add(b)
+            continue
         wt = wmap.get(b)
-        if wt and wt != cur_wt:
-            die(f"'{b}' is checked out in another worktree ({wt}) — restack there or detach it")
-        oldbase = replay_floor(git, brs, b, ptip)
-        p = git.run(
-            ["git", "-c", "rebase.updateRefs=false", "rebase", "--onto", ptip, oldbase, b],
-            capture=False,
-            check=False,
-        )
+        if wt == cur_wt:
+            wt = None
+        if wt and git.git("-C", wt, "status", "--porcelain", "--untracked-files=no"):
+            die(f"'{b}' is checked out in {wt} with uncommitted changes — "
+                "commit or stash there, then re-run")
+        onto, start = adopt or (ptip, floor)
+        p = rebase_branch(git, b, onto, start, wt)
         if p.returncode != 0:
+            where = f" in {wt}" if wt else ""
             warn(
                 f"rebase of '{b}' onto '{pname}' stopped on conflicts.\n"
-                "  resolve them, then `git rebase --continue` (or `git rebase --abort`),\n"
+                f"  resolve them{where}, then `git rebase --continue` (or `git rebase --abort`),\n"
                 "  then re-run `stack restack` — it resumes where it stopped."
             )
             sys.exit(EXIT_CONFLICT)
         brs[b]["base"] = ptip
         save_state(git, brs)
-        results.append((b, f"rebased onto {pname}{note}"))
-        moved.add(b)
+        if adopt:
+            n = git.rev_list_count(f"{onto}..{b}")
+            replayed = f", replayed {n} local commit(s)" if n else ""
+            if not n and adopted is not None:
+                adopted.add(b)
+            results.append((b, f"adopted origin/{b} (already restacked on the remote){replayed}"))
+        else:
+            results.append((b, f"rebased onto {pname}{note}"))
     return results
 
 
@@ -1428,15 +1521,19 @@ def cmd_sync(git, forge, argv):
             return b in scoped and b not in skipped
 
         # Restack the scoped chain(s), parents-first, then optionally push.
+        adopted = set()
         for root in roots_of(brs):
             if skipped & set(subtree(brs, root)):
                 continue
             members = [b for b in subtree(brs, root) if b in scoped]
             for b, action in restack_stack(git, brs, members, dry,
-                                           include_trunk=include_trunk):
+                                           include_trunk=include_trunk,
+                                           adopted=adopted):
                 print(f"  {b}: {action}")
         if not dry:
             save_state(git, brs)
+        if not all_ and anchor in brs:
+            warn_descendants_need_restack(git, brs, anchor)
         if push:
             pushable = [b for root in roots_of(brs) for b in subtree(brs, root) if in_scope(b)]
             # Re-read PR state: the maps above predate absorption, and on a
@@ -1445,7 +1542,9 @@ def cmd_sync(git, forge, argv):
             # aim a base back at the branch we just deleted.
             fresh_prs = forge.prs_for(pushable) if pushable else {}
             for b in pushable:
-                if not push_branch(git, b, dry):
+                if b in adopted or origin_tip(git, b) == git.rev(b):
+                    print(f"  {b}: up to date on origin — not pushing")
+                elif not push_branch(git, b, dry):
                     had_errors = True
                     continue
                 pr = fresh_prs.get(b)
@@ -1608,10 +1707,14 @@ Maintain
         branch's own commits — the git rebase todo editor, to drop/reorder/
         squash/edit them — then heals the stored base so branches above it
         restack cleanly onto the new tip (they're named in a note; -i can't be
-        combined with --all/--trunk/--dry-run). Local only — no fetch, no forge.
-        On a conflict: exits 3; resolve, `git rebase --continue`, then re-run
-        `stack restack` (it resumes where it stopped; `git rebase --abort`
-        backs out of the current step only).
+        combined with --all/--trunk/--dry-run). A branch whose last-fetched
+        origin/<branch> already holds that rebase (e.g. GitHub restacked it
+        after a parent merged) is moved there instead, keeping any unpushed
+        commits on top, so pushing it is a no-op. A branch checked out in
+        another clean worktree is rebased there. Local only — no fetch, no
+        forge. On a conflict: exits 3; resolve, `git rebase --continue`, then
+        re-run `stack restack` (it resumes where it stopped; `git rebase
+        --abort` backs out of the current step only).
   {ui.BOLD}submit [--all] [--ready] [--dry-run]{ui.RESET}
         Push the current branch and its ancestors (force-with-lease), create
         PRs/MRs for branches that lack one (base = parent; DRAFT unless
@@ -1626,15 +1729,16 @@ Maintain
         Fetch; start tracking local branches that have open PRs/MRs; absorb
         squash-merged ones (delete the local branch, reparent children onto
         its parent). Then restack — by default only the current branch and its
-        ancestors (down to trunk), leaving branches above it untouched since
-        they're usually checked out in other worktrees and can't be moved from
-        here; --all restacks every stack. Tracking and absorption always scan
-        every stack (they only add tracking or drop already-merged branches).
+        ancestors (down to trunk), leaving branches above it untouched (named
+        in a note); --all restacks every stack. Tracking and absorption always
+        scan every stack (they only add tracking or drop already-merged
+        branches).
         As with `restack`, the stack root is left where it sits relative to
         trunk unless --trunk is given; a root whose base has fallen off trunk
         is moved regardless. With --push, also force-push and retarget bases
-        for the same scoped branches (never creates PRs/MRs — that's
-        `submit`).
+        for the same scoped branches, skipping any already up to date on
+        origin, such as ones adopted from the remote (never creates PRs/MRs —
+        that's `submit`).
 
   {ui.BOLD}setup{ui.RESET}                     Interactively configure ryanmoelter-cli-tools.* git config.
   {ui.BOLD}help{ui.RESET}                      Show this text.

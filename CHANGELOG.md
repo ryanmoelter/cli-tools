@@ -1,6 +1,10 @@
 # Changelog
 
 ## Unreleased
+- `stack sync` and `stack restack` adopt a branch's remote head when the forge already restacked it (as GitHub does for a native stack after its bottom PRs merge), instead of rebasing again. `sync --push` then skips the push, so CI doesn't re-run on tree-identical commits. Unpushed local commits are replayed on top of the adopted head
+- `stack restack --all` and `stack sync --all` now rebase branches checked out in other worktrees, in that worktree, instead of failing. A worktree with uncommitted changes stops the run with its path
+- `stack sync --push` no longer pushes branches already up to date on origin
+- `stack sync` names the branches above the current one that still need a restack, like `stack restack` does
 - `stack sync` no longer rebases the stack root onto the latest trunk by default — pass `--trunk` for the old behavior. Being behind a fast-moving trunk isn't a restack, and rebasing (and force-pushing, under `--push`) on every sync was churn. A root whose base has fallen off trunk is still moved, as before
 - `wt prune` now also deletes merged branches that have no worktree, which previously accumulated forever
 - `wt prune` no longer aborts when `gh`/`glab` is unavailable — it warns and falls back to the branches git can prove are merged

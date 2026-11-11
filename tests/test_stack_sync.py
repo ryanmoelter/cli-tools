@@ -11,11 +11,13 @@ including any added after the merge, onto the squashed trunk — no duplicates,
 nothing dropped.
 """
 
+import io
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -81,8 +83,8 @@ def pr(number, state, head_oid, base):
             "statusCheckRollup": [], "stack": None}
 
 
-class SquashMergeSyncTest(unittest.TestCase):
-    """trunk ← b1 ← b2, b1 squash-merged, then a new commit lands on b2."""
+class SyncRepoTest(unittest.TestCase):
+    """trunk ← b1 ← b2, b1 squash-merged."""
 
     def setUp(self):
         self.dir = tempfile.mkdtemp()
@@ -141,6 +143,10 @@ class SquashMergeSyncTest(unittest.TestCase):
         self._write_state(self.state)
         stack.cmd_sync(self.git, forge, list(argv))
         return stack.load_state(self.git)[0]
+
+
+class SquashMergeSyncTest(SyncRepoTest):
+    """trunk ← b1 ← b2, b1 squash-merged, then a new commit lands on b2."""
 
     def test_tracks_an_untracked_branch_with_an_open_pr(self):
         """Fresh-clone recovery: a local branch with an open PR based on the
@@ -313,6 +319,191 @@ class SquashMergeSyncTest(unittest.TestCase):
         with open(os.path.join(d, "b1-one")) as f:
             self.assertEqual(f.read(), "reworked by the maintainer")
         self.assertEqual(brs["b2"]["base"], self.git.trunk_tip())
+
+
+class AdoptRemoteRestackTest(SyncRepoTest):
+    """trunk ← b1 ← b2 ← b3, all pushed; b1 squash-merged. A forge that
+    restacks server-side has already replayed the rest onto the squash and
+    force-pushed it, while the local branches still sit on b1's old tip.
+    Sync must adopt those remote heads rather than rebase and push again."""
+
+    def setUp(self):
+        super().setUp()
+        d = self.work
+        git("switch", "-qc", "b3", "b2", cwd=d)
+        self.b3_tip = commit(d, "b3-one")
+        git("switch", "-q", "main", cwd=d)
+        for b, sha in (("b1", self.b1_tip), ("b2", self.b2_tip), ("b3", self.b3_tip)):
+            git("push", "-q", "origin", f"{sha}:refs/heads/{b}", cwd=d)
+        git("fetch", "-q", "origin", cwd=d)
+        self.state["b3"] = {"parent": "b2", "base": self.b2_tip}
+        self.forge = StackForge({
+            "b1": pr(1, "MERGED", self.b1_tip, "main"),
+            "b2": pr(2, "OPEN", self.b2_tip, "main"),
+            "b3": pr(3, "OPEN", self.b3_tip, "b2"),
+        })
+
+    def remote_rebase(self, b, onto, old_base, then=None):
+        """Replay `b` onto `onto` and force-push it, as the forge does, leaving
+        the local branch alone. `then` may add commits first; → the new head."""
+        d = self.work
+        git("switch", "-qc", "tmp", b, cwd=d)
+        git("-c", "rebase.updateRefs=false", "rebase", "-q", "--onto", onto, old_base, cwd=d)
+        if then:
+            then()
+        sha = git("rev-parse", "HEAD", cwd=d)
+        git("push", "-q", "-f", "origin", "tmp:" + b, cwd=d)
+        git("switch", "-q", "main", cwd=d)
+        git("branch", "-D", "tmp", cwd=d)
+        return sha
+
+    def restack_remotely(self):
+        """→ (b2, b3) remote heads after the forge restacks both."""
+        r2 = self.remote_rebase("b2", self.squash, self.b1_tip)
+        r3 = self.remote_rebase("b3", r2, self.b2_tip)
+        return r2, r3
+
+    def remote(self, b):
+        return git("rev-parse", f"refs/heads/{b}", cwd=self.origin)
+
+    def run_sync(self, argv=()):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            brs = self._sync(self.forge, argv)
+        return brs, out.getvalue(), err.getvalue()
+
+    def test_adopts_a_matching_remote_and_skips_its_push(self):
+        r2, _ = self.restack_remotely()
+        brs, out, _ = self.run_sync(["--push"])
+        self.assertEqual(self.git.rev("b2"), r2)
+        self.assertEqual(self.remote("b2"), r2)
+        self.assertEqual(brs["b2"]["base"], self.squash)
+        self.assertIn("b2: adopted origin/b2 (already restacked on the remote)", out)
+        self.assertIn("b2: up to date on origin — not pushing", out)
+        self.assertNotIn("pushed b2", out)
+
+    def test_adopts_a_remote_with_extra_commits(self):
+        r2 = self.remote_rebase("b2", self.squash, self.b1_tip,
+                                then=lambda: commit(self.work, "bot-translations"))
+        brs, out, _ = self.run_sync(["--push"])
+        self.assertEqual(self.git.rev("b2"), r2)
+        self.assertEqual(subjects(self.work, "b2")[0], "bot-translations")
+        self.assertNotIn("pushed b2", out)
+
+    def test_replays_unpushed_local_commits_onto_the_adopted_head(self):
+        r2, _ = self.restack_remotely()
+        git("switch", "-q", "b2", cwd=self.work)
+        commit(self.work, "b2-unpushed")
+        brs, out, _ = self.run_sync(["--push"])
+        self.assertEqual(git("rev-parse", "b2^", cwd=self.work), r2)
+        got = subjects(self.work, "b2")
+        self.assertEqual(got[0], "b2-unpushed")
+        for s in ("b2-one", "b2-two", "b2-unpushed"):
+            self.assertEqual(got.count(s), 1, f"{s} wrong count: {got}")
+        self.assertIn("replayed 1 local commit(s)", out)
+        self.assertEqual(self.remote("b2"), self.git.rev("b2"))
+        self.assertIn("pushed b2", out)
+
+    def test_rebases_when_the_remote_was_not_restacked(self):
+        brs, out, _ = self.run_sync()
+        self.assertIn("b2: rebased onto main", out)
+        self.assertTrue(self.git.is_ancestor(self.squash, self.git.rev("b2")))
+        self.assertEqual(self.remote("b2"), self.b2_tip)
+
+    def test_rebases_when_the_remote_restack_differs(self):
+        def rework():
+            with open(os.path.join(self.work, "b2-two"), "w") as f:
+                f.write("different")
+            git("commit", "-qam", "b2-two", "--amend", cwd=self.work)
+        r2 = self.remote_rebase("b2", self.squash, self.b1_tip, then=rework)
+        brs, out, _ = self.run_sync()
+        self.assertIn("b2: rebased onto main", out)
+        self.assertNotEqual(self.git.rev("b2"), r2)
+        self.assertTrue(self.git.is_ancestor(self.squash, self.git.rev("b2")))
+
+    def test_all_adopts_the_whole_remaining_chain(self):
+        r2, r3 = self.restack_remotely()
+        brs, out, _ = self.run_sync(["--all", "--push"])
+        self.assertEqual(self.git.rev("b2"), r2)
+        self.assertEqual(self.git.rev("b3"), r3)
+        self.assertEqual(brs["b3"]["base"], r2)
+        self.assertNotIn("pushed", out)
+
+    def test_default_scope_names_the_children_left_behind(self):
+        self.restack_remotely()
+        brs, out, err = self.run_sync()
+        self.assertEqual(self.git.rev("b3"), self.b3_tip)
+        self.assertIn("branches above 'b2' may need their own restack: b3", err)
+
+    def add_worktree(self, b):
+        wt = os.path.join(self.dir, "wt-" + b)
+        git("worktree", "add", "-q", wt, b, cwd=self.work)
+        return wt
+
+    def test_adopts_a_branch_checked_out_in_another_worktree(self):
+        _, r3 = self.restack_remotely()
+        wt = self.add_worktree("b3")
+        self.run_sync(["--all"])
+        self.assertEqual(self.git.rev("b3"), r3)
+        self.assertEqual(git("rev-parse", "HEAD", cwd=wt), r3)
+
+    def test_rebases_a_branch_checked_out_in_another_worktree(self):
+        wt = self.add_worktree("b3")
+        self.run_sync(["--all"])
+        self.assertTrue(self.git.is_ancestor(self.git.rev("b2"), self.git.rev("b3")))
+        self.assertEqual(git("rev-parse", "HEAD", cwd=wt), self.git.rev("b3"))
+        self.assertEqual(subjects(wt, "HEAD")[:3], ["b3-one", "b2-two", "b2-one"])
+
+    def test_dirty_worktree_stops_with_its_path(self):
+        self.restack_remotely()
+        wt = self.add_worktree("b3")
+        with open(os.path.join(wt, "b3-one"), "w") as f:
+            f.write("wip")
+        err = io.StringIO()
+        with self.assertRaises(SystemExit), redirect_stderr(err), redirect_stdout(io.StringIO()):
+            self._sync(self.forge, ["--all"])
+        self.assertIn(f"'b3' is checked out in {os.path.realpath(wt)} with uncommitted changes",
+                      err.getvalue())
+        self.assertEqual(self.git.rev("b3"), self.b3_tip)
+
+    def test_dry_run_reports_each_decision(self):
+        self.restack_remotely()
+        brs, out, _ = self.run_sync(["--all", "--push", "--dry-run"])
+        self.assertIn("b2: would adopt origin/b2 (already restacked on the remote)", out)
+        self.assertIn("b3: would adopt origin/b3 (already restacked on the remote)", out)
+        self.assertIn("b2: up to date on origin — not pushing", out)
+        self.assertNotIn("would push", out)
+        self.assertEqual(self.git.rev("b2"), self.b2_tip)
+        self.assertEqual(self.git.rev("b3"), self.b3_tip)
+
+    def test_dry_run_rebase_cascades_to_children(self):
+        brs, out, _ = self.run_sync(["--all", "--dry-run"])
+        self.assertIn("b2: would rebase onto main", out)
+        self.assertIn("b3: would rebase onto b2", out)
+
+    def restack_after_absorb(self):
+        """`stack restack` from b2 once b1 is gone, with origin unreachable."""
+        git("switch", "-q", "b2", cwd=self.work)
+        git("branch", "-D", "b1", cwd=self.work)
+        git("remote", "set-url", "origin", "/nonexistent", cwd=self.work)
+        self._write_state({"b2": {"parent": "main", "base": self.b1_tip}})
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            stack.cmd_restack(self.git, None, [])
+        return out.getvalue()
+
+    def test_restack_adopts_from_fetched_refs_without_network(self):
+        r2, _ = self.restack_remotely()
+        git("fetch", "-q", "origin", cwd=self.work)
+        out = self.restack_after_absorb()
+        self.assertIn("b2: adopted origin/b2", out)
+        self.assertEqual(self.git.rev("b2"), r2)
+
+    def test_restack_rebases_without_a_remote_branch(self):
+        git("update-ref", "-d", "refs/remotes/origin/b2", cwd=self.work)
+        out = self.restack_after_absorb()
+        self.assertIn("b2: rebased onto main", out)
+        self.assertTrue(self.git.is_ancestor(self.squash, self.git.rev("b2")))
 
 
 if __name__ == "__main__":
